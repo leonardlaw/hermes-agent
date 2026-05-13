@@ -73,6 +73,7 @@ export interface ConfigDisplayConfig {
   // validation anyway.
   tui_status_indicator?: string
   tui_statusbar?: 'bottom' | 'off' | 'on' | 'top' | boolean
+  theme_mode?: string
 }
 
 export interface ConfigVoiceConfig {
