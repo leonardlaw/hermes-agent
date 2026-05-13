@@ -21,6 +21,12 @@ import type { StatusBarMode } from '../../interfaces.js'
 import { patchOverlayState } from '../../overlayStore.js'
 import { patchUiState } from '../../uiStore.js'
 import type { SlashCommand } from '../types.js'
+import {
+  DARK_THEME,
+  LIGHT_THEME,
+  detectLightMode,
+  normalizeThemeForAnsiLightTerminal
+} from '../../../theme.js'
 
 const flagFromArg = (arg: string, current: boolean): boolean | null => {
   if (!arg) {
@@ -607,6 +613,51 @@ export const coreCommands: SlashCommand[] = [
           ctx.transcript.send(last)
         })
       )
+    }
+  },
+
+  {
+    aliases: ['themes', 'darkmode'],
+    help: 'switch theme mode [light|dark|toggle]',
+    name: 'theme',
+    usage: '/theme [light|dark|toggle]',
+    run: (arg, ctx) => {
+      const mode = arg.trim().toLowerCase()
+
+      // No arg — show current mode.
+      if (!mode || mode === 'status') {
+        const isLight = detectLightMode(process.env)
+        ctx.transcript.sys(`theme mode: ${isLight ? 'light' : 'dark'}`)
+
+        return
+      }
+
+      // Resolve the requested mode.
+      const isDark =
+        mode === 'dark'
+          ? true
+          : mode === 'light'
+            ? false
+            : !detectLightMode(process.env)
+
+      const isLight = !isDark
+      const base = isDark ? DARK_THEME : LIGHT_THEME
+      const theme = normalizeThemeForAnsiLightTerminal(base, process.env, isLight)
+
+      // Hot-swap the running TUI immediately.
+      patchUiState({ theme })
+
+      // Persist to gateway config so it survives restart.
+      ctx.gateway
+        .rpc<ConfigSetResponse>('config.set', { key: 'theme_mode', value: isDark ? 'dark' : 'light' })
+        .then(
+          ctx.guarded<ConfigSetResponse>(r => {
+            ctx.transcript.sys(`theme mode → ${r.value === 'dark' ? 'dark' : 'light'}`)
+          })
+        )
+        .catch(() => {
+          ctx.transcript.sys(`theme mode → ${isDark ? 'dark' : 'light'} (not persisted)`)
+        })
     }
   }
 ]
