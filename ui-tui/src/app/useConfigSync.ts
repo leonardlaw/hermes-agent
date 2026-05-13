@@ -2,6 +2,12 @@ import { useEffect, useRef } from 'react'
 
 import { resolveDetailsMode, resolveSections } from '../domain/details.js'
 import type { GatewayClient } from '../gatewayClient.js'
+import {
+  DARK_THEME,
+  LIGHT_THEME,
+  detectLightMode,
+  normalizeThemeForAnsiLightTerminal
+} from '../theme.js'
 import type {
   ConfigFullResponse,
   ConfigMtimeResponse,
@@ -149,6 +155,18 @@ export const applyDisplay = (
     statusBar: normalizeStatusBar(d.tui_statusbar),
     streaming: d.streaming !== false
   })
+
+  // Apply persisted theme_mode preference (light/dark) from display config.
+  // Overrides auto-detection of detectLightMode().  Only applies the built-in
+  // palettes — if a custom skin is also active, the skin's colors take
+  // precedence on the next `skin.changed` event.
+  const themeMode = typeof d.theme_mode === 'string' ? d.theme_mode.trim().toLowerCase() : ''
+  if (themeMode === 'light' || themeMode === 'dark') {
+    const isDark = themeMode === 'dark'
+    const base = isDark ? DARK_THEME : LIGHT_THEME
+    const theme = normalizeThemeForAnsiLightTerminal(base, process.env, !isDark)
+    patchUiState({ theme })
+  }
 }
 
 export function useConfigSync({
