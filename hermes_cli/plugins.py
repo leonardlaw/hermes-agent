@@ -640,6 +640,29 @@ class PluginContext:
             self.manifest.name, provider.name,
         )
 
+    def register_model_router_provider(self, provider) -> None:
+        """Register a model router for inbound message classification.
+
+        ``provider`` must be an instance of
+        :class:`agent.model_router_provider.ModelRouterProvider`.
+        The ``provider.name`` attribute is the display key.
+        """
+        from agent.model_router_provider import ModelRouterProvider
+        from agent.model_router_registry import register_provider as _register_model_router_provider
+
+        if not isinstance(provider, ModelRouterProvider):
+            logger.warning(
+                "Plugin '%s' tried to register a model router that does "
+                "not inherit from ModelRouterProvider. Ignoring.",
+                self.manifest.name,
+            )
+            return
+        _register_model_router_provider(provider)
+        logger.info(
+            "Plugin '%s' registered model router provider: %s",
+            self.manifest.name, provider.name,
+        )
+
     # -- platform adapter registration ---------------------------------------
 
     def register_platform(

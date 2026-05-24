@@ -3662,6 +3662,14 @@ class GatewayRunner:
             self._gateway_loop = None
         logger.info("Session storage: %s", self.config.sessions_dir)
 
+        # Discover and load plugins (user plugins at ~/.hermes/plugins/)
+        try:
+            from hermes_cli.plugins import discover_plugins
+            discover_plugins()
+            logger.info("Plugin discovery completed")
+        except Exception as _plug_exc:
+            logger.debug("Plugin discovery skipped: %s", _plug_exc)
+        
         # Sanity-check that systemd's TimeoutStopSec covers our drain
         # window.  When the user upgraded hermes-agent without re-running
         # ``hermes setup``, their unit file may still encode the old
@@ -7969,13 +7977,17 @@ class GatewayRunner:
             self._set_session_reasoning_override(session_key, None)
             if hasattr(self, "_pending_model_notes"):
                 self._pending_model_notes.pop(session_key, None)
-        
-        # Emit session:start for new or auto-reset sessions
+
+        # Determine if this is a new session (for model routing + session:start)
         _is_new_session = (
             session_entry.created_at == session_entry.updated_at
             or getattr(session_entry, "was_auto_reset", False)
             or getattr(session_entry, "is_fresh_reset", False)
         )
+        
+        # Emit session:start for new or auto-reset sessions
+        # NOTE: includes event.text so model-router plugins can classify the
+        # inbound message and set _session_model_overrides before agent build.
         # Consume the is_fresh_reset flag immediately so it doesn't leak
         # onto subsequent messages in the same session (issue #6508).
         if getattr(session_entry, "is_fresh_reset", False):
@@ -7986,6 +7998,8 @@ class GatewayRunner:
                 "user_id": source.user_id,
                 "session_id": session_entry.session_id,
                 "session_key": session_key,
+                "text": event.text or "",
+                "has_image": bool(getattr(event, "image", None)),
             })
         
         # Build session context
