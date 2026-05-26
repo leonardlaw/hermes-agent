@@ -897,67 +897,76 @@ def mark_job_run(job_id: str, success: bool, error: Optional[str] = None,
 
     ``delivery_error`` is tracked separately from the agent error — a job
     can succeed (agent produced output) but fail delivery (platform down).
+
+    Persistence failures are caught and logged at ERROR level; this function
+    never raises so the scheduler can continue processing other jobs.
     """
-    with _jobs_file_lock:
-        jobs = load_jobs()
-        for i, job in enumerate(jobs):
-            if job["id"] == job_id:
-                now = _hermes_now().isoformat()
-                job["last_run_at"] = now
-                job["last_status"] = "ok" if success else "error"
-                job["last_error"] = error if not success else None
-                # Track delivery failures separately — cleared on successful delivery
-                job["last_delivery_error"] = delivery_error
-                
-                # Increment completed count
-                if job.get("repeat"):
-                    job["repeat"]["completed"] = job["repeat"].get("completed", 0) + 1
+    try:
+        with _jobs_file_lock:
+            jobs = load_jobs()
+            for i, job in enumerate(jobs):
+                if job["id"] == job_id:
+                    now = _hermes_now().isoformat()
+                    job["last_run_at"] = now
+                    job["last_status"] = "ok" if success else "error"
+                    job["last_error"] = error if not success else None
+                    # Track delivery failures separately — cleared on successful delivery
+                    job["last_delivery_error"] = delivery_error
                     
-                    # Check if we've hit the repeat limit
-                    times = job["repeat"].get("times")
-                    completed = job["repeat"]["completed"]
-                    if times is not None and times > 0 and completed >= times:
-                        # Remove the job (limit reached)
-                        jobs.pop(i)
-                        _save_jobs_with_retry(jobs, job_id)
-                        return
-                
-                # Compute next run
-                job["next_run_at"] = compute_next_run(job["schedule"], now)
+                    # Increment completed count
+                    if job.get("repeat"):
+                        job["repeat"]["completed"] = job["repeat"].get("completed", 0) + 1
+                        
+                        # Check if we've hit the repeat limit
+                        times = job["repeat"].get("times")
+                        completed = job["repeat"]["completed"]
+                        if times is not None and times > 0 and completed >= times:
+                            # Remove the job (limit reached)
+                            jobs.pop(i)
+                            _save_jobs_with_retry(jobs, job_id)
+                            return
+                    
+                    # Compute next run
+                    job["next_run_at"] = compute_next_run(job["schedule"], now)
 
-                # If no next run, decide whether this is terminal completion
-                # (one-shot) or a transient failure (recurring schedule couldn't
-                # compute — e.g. 'croniter' missing from the runtime env).
-                # Recurring jobs must NEVER be silently disabled: that turns a
-                # missing runtime dep into "job completed" and the user's
-                # schedule quietly goes off. See issue #16265.
-                if job["next_run_at"] is None:
-                    kind = job.get("schedule", {}).get("kind")
-                    if kind in {"cron", "interval"}:
-                        job["state"] = "error"
-                        if not job.get("last_error"):
-                            job["last_error"] = (
-                                "Failed to compute next run for recurring "
-                                "schedule (is the 'croniter' package "
-                                "installed in the gateway's Python env?)"
+                    # If no next run, decide whether this is terminal completion
+                    # (one-shot) or a transient failure (recurring schedule couldn't
+                    # compute — e.g. 'croniter' missing from the runtime env).
+                    # Recurring jobs must NEVER be silently disabled: that turns a
+                    # missing runtime dep into "job completed" and the user's
+                    # schedule quietly goes off. See issue #16265.
+                    if job["next_run_at"] is None:
+                        kind = job.get("schedule", {}).get("kind")
+                        if kind in {"cron", "interval"}:
+                            job["state"] = "error"
+                            if not job.get("last_error"):
+                                job["last_error"] = (
+                                    "Failed to compute next run for recurring "
+                                    "schedule (is the 'croniter' package "
+                                    "installed in the gateway's Python env?)"
+                                )
+                            logger.error(
+                                "Job '%s' (%s) could not compute next_run_at; "
+                                "leaving enabled and marking state=error so the "
+                                "job is not silently disabled.",
+                                job.get("name", job["id"]),
+                                kind,
                             )
-                        logger.error(
-                            "Job '%s' (%s) could not compute next_run_at; "
-                            "leaving enabled and marking state=error so the "
-                            "job is not silently disabled.",
-                            job.get("name", job["id"]),
-                            kind,
-                        )
-                    else:
-                        job["enabled"] = False
-                        job["state"] = "completed"
-                elif job.get("state") != "paused":
-                    job["state"] = "scheduled"
+                        else:
+                            job["enabled"] = False
+                            job["state"] = "completed"
+                    elif job.get("state") != "paused":
+                        job["state"] = "scheduled"
 
-                _save_jobs_with_retry(jobs, job_id)
-                return
+                    _save_jobs_with_retry(jobs, job_id)
+                    return
 
-        logger.warning("mark_job_run: job_id %s not found, skipping save", job_id)
+            logger.warning("mark_job_run: job_id %s not found, skipping save", job_id)
+    except Exception as exc:
+        logger.error(
+            "mark_job_run failed to persist state for job '%s' (success=%s): %s",
+            job_id, success, exc,
+        )
 
 
 def advance_next_run(job_id: str) -> bool:
@@ -1126,6 +1135,69 @@ def save_job_output(job_id: str, output: str):
         raise
     
     return output_file
+
+
+def check_cron_persisted_state() -> List[Dict[str, Any]]:
+    """Health check: detect jobs whose output files are newer than last_run_at.
+
+    This catches the failure mode where a job executed successfully (output was
+    saved) but ``mark_job_run`` could not persist the updated state to
+    ``jobs.json`` (e.g. due to an IO error or concurrent write conflict).
+
+    Returns a list of alert dicts, each with ``job_id``, ``job_name``,
+    ``last_run_at``, and ``newest_output_mtime`` (ISO format).  An empty list
+    means no anomalies were found.
+    """
+    alerts: List[Dict[str, Any]] = []
+    with _jobs_file_lock:
+        jobs = load_jobs()
+
+    for job in jobs:
+        job_id = job["id"]
+        job_name = job.get("name", job_id)
+        last_run_at = job.get("last_run_at")
+        job_output_dir = OUTPUT_DIR / job_id
+        if not job_output_dir.exists():
+            continue
+
+        output_files = [f for f in job_output_dir.iterdir() if f.is_file()]
+        if not output_files:
+            continue
+
+        newest_mtime = max(f.stat().st_mtime for f in output_files)
+        newest_dt = datetime.fromtimestamp(newest_mtime)
+        newest_iso = _ensure_aware(newest_dt).isoformat()
+
+        if last_run_at is None:
+            # Output exists but job was never marked as run — definite anomaly
+            alerts.append({
+                "job_id": job_id,
+                "job_name": job_name,
+                "last_run_at": None,
+                "newest_output_mtime": newest_iso,
+            })
+            logger.error(
+                "CRON HEALTH CHECK: Job '%s' has output files but last_run_at is null. "
+                "mark_job_run likely failed to persist after a successful run.",
+                job_name,
+            )
+        else:
+            last_run_dt = _ensure_aware(datetime.fromisoformat(last_run_at))
+            newest_aware = _ensure_aware(newest_dt)
+            if newest_aware > last_run_dt:
+                alerts.append({
+                    "job_id": job_id,
+                    "job_name": job_name,
+                    "last_run_at": last_run_at,
+                    "newest_output_mtime": newest_iso,
+                })
+                logger.error(
+                    "CRON HEALTH CHECK: Job '%s' has output newer than last_run_at "
+                    "(output %s > last_run %s). mark_job_run likely failed to persist.",
+                    job_name, newest_iso, last_run_at,
+                )
+
+    return alerts
 
 
 # =============================================================================
