@@ -121,7 +121,7 @@ _LEGACY_HOME_TARGET_ENV_VARS = {
     "QQBOT_HOME_CHANNEL": "QQ_HOME_CHANNEL",
 }
 
-from cron.jobs import get_due_jobs, mark_job_run, save_job_output, advance_next_run
+from cron.jobs import get_due_jobs, mark_job_run, save_job_output, advance_next_run, check_cron_persisted_state
 
 # Sentinel: when a cron agent has nothing new to report, it can start its
 # response with this marker to suppress delivery.  Output is still saved
@@ -1778,6 +1778,14 @@ def tick(verbose: bool = True, adapters=None, loop=None) -> int:
             _kill_orphaned_mcp_children()
         except Exception as _e:
             logger.debug("Post-tick MCP orphan cleanup failed: %s", _e)
+
+        # Health check: detect jobs whose output files are newer than the
+        # persisted last_run_at.  This catches mark_job_run persistence
+        # failures that would otherwise go unnoticed.
+        try:
+            check_cron_persisted_state()
+        except Exception as _hc_exc:
+            logger.debug("Post-tick persisted-state health check failed: %s", _hc_exc)
 
         return sum(_results)
     finally:

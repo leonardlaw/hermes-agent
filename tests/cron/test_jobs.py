@@ -24,6 +24,7 @@ from cron.jobs import (
     advance_next_run,
     get_due_jobs,
     save_job_output,
+    check_cron_persisted_state,
 )
 
 
@@ -476,17 +477,18 @@ class TestMarkJobRun:
         job = create_job(prompt="Doomed", schedule="every 1h")
         monkeypatch.setattr("cron.jobs.save_jobs", lambda _jobs: (_ for _ in ()).throw(OSError("read-only filesystem")))
 
-        with pytest.raises(OSError):
-            mark_job_run(job["id"], success=True)
+        # mark_job_run must NOT raise — it logs ERROR and returns gracefully
+        mark_job_run(job["id"], success=True)
 
         error_records = [r for r in caplog.records if r.levelname == "ERROR"]
         assert error_records, "Expected at least one ERROR log record"
-        msg = error_records[-1].getMessage()
-        assert job["id"] in msg, f"ERROR log should contain job_id: {msg}"
-        # Timestamp is included in the message (ISO format from _hermes_now)
+        # Both _save_jobs_with_retry and mark_job_run log ERROR; at least one
+        # must contain the job_id, timestamp, and exception details.
+        all_error_text = " ".join(r.getMessage() for r in error_records)
+        assert job["id"] in all_error_text, f"ERROR log should contain job_id: {all_error_text}"
         import re
-        assert re.search(r"\d{4}-\d{2}-\d{2}T", msg), f"ERROR log should contain ISO timestamp: {msg}"
-        assert "read-only filesystem" in msg, f"ERROR log should contain exception details: {msg}"
+        assert re.search(r"\d{4}-\d{2}-\d{2}T", all_error_text), f"ERROR log should contain ISO timestamp: {all_error_text}"
+        assert "read-only filesystem" in all_error_text, f"ERROR log should contain exception details: {all_error_text}"
 
 
 class TestAdvanceNextRun:
@@ -899,3 +901,63 @@ class TestSaveJobOutput:
         assert output_file.exists()
         assert output_file.read_text() == "# Results\nEverything ok."
         assert "test123" in str(output_file)
+
+
+class TestMarkJobRunResilience:
+    def test_does_not_raise_when_save_fails(self, tmp_cron_dir, caplog):
+        """mark_job_run must swallow terminal save failures and log ERROR."""
+        job = create_job(prompt="resilience test", schedule="every 1h")
+
+        with patch("cron.jobs.save_jobs") as mock_save:
+            mock_save.side_effect = OSError("disk full")
+            # _save_jobs_with_retry will exhaust retries and raise; mark_job_run
+            # should catch it and log rather than propagating.
+            mark_job_run(job["id"], success=True)
+
+        # If we reach this point, mark_job_run did not raise — good.
+        assert "mark_job_run failed to persist state" in caplog.text
+        assert job["id"] in caplog.text
+
+
+class TestCheckCronPersistedState:
+    def test_no_alert_when_output_older_than_last_run(self, tmp_cron_dir):
+        """Healthy job: output exists and is older than last_run_at."""
+        job = create_job(prompt="healthy job", schedule="every 1h")
+        mark_job_run(job["id"], success=True)
+        # Output saved during mark_job_run... wait, we need to manually save output
+        save_job_output(job["id"], "old output")
+        # Sleep briefly so output mtime < last_run_at (which is just set)
+        import time
+        time.sleep(0.1)
+        save_job_output(job["id"], "new output")
+        # But wait, the new output will be newer. Let me think...
+        # Actually, after mark_job_run, last_run_at is set to now.
+        # If we then save output, the output will be newer.
+        # So let's re-mark after saving.
+        mark_job_run(job["id"], success=True)
+
+        alerts = check_cron_persisted_state()
+        assert alerts == []
+
+    def test_alert_when_output_newer_than_last_run(self, tmp_cron_dir):
+        """Anomaly: output exists and is newer than last_run_at."""
+        job = create_job(prompt="stale state job", schedule="every 1h")
+        # Simulate a run that produced output but whose mark_job_run failed
+        save_job_output(job["id"], "orphan output")
+        # Deliberately do NOT call mark_job_run
+
+        alerts = check_cron_persisted_state()
+        assert len(alerts) == 1
+        assert alerts[0]["job_id"] == job["id"]
+        assert alerts[0]["last_run_at"] is None
+
+    def test_alert_when_output_exists_but_last_run_at_null(self, tmp_cron_dir):
+        """Anomaly: job has output but was never marked as run."""
+        job = create_job(prompt="never-marked job", schedule="every 1h")
+        save_job_output(job["id"], "some output")
+
+        alerts = check_cron_persisted_state()
+        assert len(alerts) == 1
+        assert alerts[0]["job_id"] == job["id"]
+        assert alerts[0]["last_run_at"] is None
+        assert "newest_output_mtime" in alerts[0]
