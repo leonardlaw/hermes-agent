@@ -18,7 +18,6 @@ from __future__ import annotations
 
 import json
 import logging
-import os
 import time
 from types import SimpleNamespace
 from typing import Any, Callable, Dict, List
@@ -74,7 +73,10 @@ def _record_codex_app_server_usage(agent, turn) -> dict[str, Any]:
             try:
                 if not agent._session_db_created:
                     agent._ensure_db_session()
-                agent._session_db.update_token_counts(
+                # Enqueued for the SessionDB background writer — keeps the
+                # per-call accounting write off the turn thread (see
+                # conversation_loop's queue_token_counts call).
+                agent._session_db.queue_token_counts(
                     agent.session_id,
                     model=agent.model,
                     billing_provider=agent.provider,
@@ -154,7 +156,8 @@ def _record_codex_app_server_usage(agent, turn) -> dict[str, Any]:
         try:
             if not agent._session_db_created:
                 agent._ensure_db_session()
-            agent._session_db.update_token_counts(
+            # Enqueued for the SessionDB background writer (see above).
+            agent._session_db.queue_token_counts(
                 agent.session_id,
                 input_tokens=canonical_usage.input_tokens,
                 output_tokens=canonical_usage.output_tokens,
@@ -456,6 +459,27 @@ def make_codex_app_server_event_bridge(agent) -> Callable[[dict], None]:
     # even when codex doesn't report durationMs.
     started: dict[str, tuple[str, dict, float]] = {}
 
+    def _stable_call_id(item: dict, name: str) -> str:
+        """Deterministic tool_call id mirroring CodexEventProjector, so a
+        live TUI tool card correlates with the same tool call after the
+        session is resumed and history is projected."""
+        from agent.transports.codex_event_projector import _deterministic_call_id
+
+        item_id = item.get("id") or ""
+        item_type = item.get("type") or ""
+        if item_type == "commandExecution":
+            return _deterministic_call_id("exec", item_id)
+        if item_type == "fileChange":
+            return _deterministic_call_id("apply_patch", item_id)
+        if item_type == "mcpToolCall":
+            server = item.get("server") or "mcp"
+            tool = item.get("tool") or "unknown"
+            return _deterministic_call_id(f"mcp__{server}__{tool}", item_id)
+        if item_type == "dynamicToolCall":
+            tool = item.get("tool") or "unknown"
+            return _deterministic_call_id(f"dyn_{tool}", item_id)
+        return _deterministic_call_id(name, item_id)
+
     def _fire_tool_started(item: dict) -> None:
         item_id = item.get("id") or ""
         name = _codex_item_to_tool_name(item)
@@ -463,15 +487,26 @@ def make_codex_app_server_event_bridge(agent) -> Callable[[dict], None]:
         if item_id:
             started[item_id] = (name, args, time.monotonic())
         cb = getattr(agent, "tool_progress_callback", None)
-        if cb is None:
-            return
-        try:
-            cb("tool.started", name, _codex_item_to_preview(item), args)
-        except Exception:
-            logger.debug(
-                "tool_progress_callback raised on tool.started for %s",
-                name, exc_info=True,
-            )
+        if cb is not None:
+            try:
+                cb("tool.started", name, _codex_item_to_preview(item), args)
+            except Exception:
+                logger.debug(
+                    "tool_progress_callback raised on tool.started for %s",
+                    name, exc_info=True,
+                )
+        # Authoritative stable-ID tool card (TUI / desktop). Fires
+        # alongside tool_progress so surfaces that render structured tool
+        # cards (not just progress bubbles) stay correlated with the
+        # projected history entry after a resume.
+        start_cb = getattr(agent, "tool_start_callback", None)
+        if start_cb is not None:
+            try:
+                start_cb(_stable_call_id(item, name), name, args)
+            except Exception:
+                logger.debug(
+                    "tool_start_callback raised for %s", name, exc_info=True,
+                )
 
     def _fire_tool_completed(item: dict) -> None:
         item_id = item.get("id") or ""
@@ -489,16 +524,24 @@ def make_codex_app_server_event_bridge(agent) -> Callable[[dict], None]:
             duration = time.monotonic() - prior[2]
         result, is_error = _codex_item_completion_payload(item)
         cb = getattr(agent, "tool_progress_callback", None)
-        if cb is None:
-            return
-        try:
-            cb("tool.completed", name, None, None,
-               duration=duration, is_error=is_error, result=result)
-        except Exception:
-            logger.debug(
-                "tool_progress_callback raised on tool.completed for %s",
-                name, exc_info=True,
-            )
+        if cb is not None:
+            try:
+                cb("tool.completed", name, None, None,
+                   duration=duration, is_error=is_error, result=result)
+            except Exception:
+                logger.debug(
+                    "tool_progress_callback raised on tool.completed for %s",
+                    name, exc_info=True,
+                )
+        complete_cb = getattr(agent, "tool_complete_callback", None)
+        if complete_cb is not None:
+            args = prior[1] if prior is not None else _codex_item_to_args(item)
+            try:
+                complete_cb(_stable_call_id(item, name), name, args, result)
+            except Exception:
+                logger.debug(
+                    "tool_complete_callback raised for %s", name, exc_info=True,
+                )
 
     def _fire_text_delta(params: dict) -> None:
         text = params.get("delta") or params.get("text") or ""
@@ -553,7 +596,7 @@ def make_codex_app_server_event_bridge(agent) -> Callable[[dict], None]:
         if method == "item/agentMessage/delta":
             _fire_text_delta(params)
             return
-        if method == "item/reasoning/delta":
+        if method in {"item/reasoning/delta", "item/reasoning/summaryDelta"}:
             _fire_reasoning_delta(params)
             return
         item = params.get("item")
@@ -662,6 +705,16 @@ def run_codex_app_server_turn(
         except Exception:
             pass
         agent._codex_session = None
+        _user_interrupted = bool(
+            getattr(agent, "_interrupt_requested", False)
+        )
+        _interrupt_message = (
+            getattr(agent, "_interrupt_message", None)
+            if _user_interrupted
+            else None
+        )
+        if _user_interrupted:
+            agent.clear_interrupt()
         return {
             "final_response": (
                 f"Codex app-server turn failed: {exc}. "
@@ -671,8 +724,26 @@ def run_codex_app_server_turn(
             "api_calls": 0,
             "completed": False,
             "partial": True,
+            "interrupted": _user_interrupted,
+            **(
+                {"interrupt_message": _interrupt_message}
+                if _interrupt_message
+                else {}
+            ),
             "error": str(exc),
         }
+
+    # This runtime bypasses the normal conversation-loop finalizer. Mirror its
+    # interrupt handoff/cleanup so a hard stop cannot poison the next turn and a
+    # message-bearing compatibility interrupt can still be replayed by callers.
+    _user_interrupted = bool(
+        turn.interrupted and getattr(agent, "_interrupt_requested", False)
+    )
+    _interrupt_message = (
+        getattr(agent, "_interrupt_message", None) if _user_interrupted else None
+    )
+    if _user_interrupted:
+        agent.clear_interrupt()
 
     # If the turn signalled the underlying client is wedged (deadline
     # blown, post-tool watchdog tripped, OAuth refresh died, subprocess
@@ -710,11 +781,26 @@ def run_codex_app_server_turn(
         # the already-flushed user turn). See gateway/run.py agent_persisted.
         if getattr(agent, "_session_db", None) is not None:
             try:
-                agent._flush_messages_to_session_db(messages)
+                _codex_flush_ok = agent._flush_messages_to_session_db(messages)
             except Exception:
-                logger.debug(
+                _codex_flush_ok = False
+                logger.warning(
                     "codex app-server projected-message flush failed",
                     exc_info=True,
+                )
+            if _codex_flush_ok is False:
+                # Unlike the chat-completions loop (which fails closed BEFORE
+                # projection — see conversation_loop session_persistence_failed),
+                # codex output has already streamed to the user by the time this
+                # flush runs, so there is nothing left to withhold. We cannot
+                # flip agent_persisted=False either: the gateway fallback write
+                # would re-INSERT the already-flushed user turn (#860/#42039).
+                # Surface the durability gap loudly instead of a silent debug.
+                logger.warning(
+                    "codex app-server turn was delivered but could NOT be "
+                    "persisted to the session DB (session=%s) — this turn "
+                    "will be missing after restart/resume",
+                    getattr(agent, "session_id", None),
                 )
 
 
@@ -779,6 +865,12 @@ def run_codex_app_server_turn(
         "api_calls": api_calls,
         "completed": not turn.interrupted and turn.error is None,
         "partial": turn.interrupted or turn.error is not None,
+        "interrupted": _user_interrupted,
+        **(
+            {"interrupt_message": _interrupt_message}
+            if _interrupt_message
+            else {}
+        ),
         "error": turn.error,
         # The codex app-server runtime IS an early-return path that bypasses
         # conversation_loop, but we flush the projected assistant/tool messages
@@ -1147,6 +1239,8 @@ def run_codex_stream(agent, api_kwargs: dict, client: Any = None, on_first_delta
     """
     import httpx as _httpx
 
+    from agent import relay_llm
+
     active_client = client or agent._ensure_primary_openai_client(reason="codex_stream_direct")
     max_stream_retries = 1
     # Accumulate streamed text so callers / compat shims can read it.
@@ -1171,48 +1265,88 @@ def run_codex_stream(agent, api_kwargs: dict, client: Any = None, on_first_delta
         if agent._interrupt_requested:
             raise InterruptedError("Agent interrupted before Codex stream retry")
 
-        stream_kwargs = dict(api_kwargs)
-        stream_kwargs["stream"] = True
+        intercepted_events = []
+        writer_token = {"value": None}
+
+        def _open_codex_stream(next_api_kwargs: dict[str, Any]):
+            stream_kwargs = dict(next_api_kwargs)
+            stream_kwargs["stream"] = True
+            return active_client.responses.create(**stream_kwargs)
+
+        def _codex_stream_created(_raw_stream: Any) -> None:
+            # Claim the delta sink for THIS physical attempt. A newer attempt
+            # supersedes this token and fences late deltas out of the turn.
+            writer_token["value"] = claim_stream_writer(agent)
+
+        def _accept_codex_chunk(_chunk: Any) -> bool:
+            token = writer_token["value"]
+            if token is None or stream_writer_is_current(agent, token):
+                return True
+            logger.warning(
+                "Codex streaming attempt superseded by a newer stream; "
+                "stopping consumption to preserve the single-writer "
+                "invariant (model=%s).",
+                api_kwargs.get("model", "unknown"),
+            )
+            return False
+
+        def _finalize_codex_stream() -> Any:
+            return _consume_codex_event_stream(
+                list(intercepted_events),
+                model=api_kwargs.get("model"),
+            )
 
         try:
-            event_stream = active_client.responses.create(**stream_kwargs)
-        except (_httpx.RemoteProtocolError, _httpx.ReadTimeout, _httpx.ConnectError, ConnectionError) as exc:
+            event_stream = relay_llm.stream(
+                dict(api_kwargs),
+                _open_codex_stream,
+                session_id=str(getattr(agent, "session_id", "") or ""),
+                name=str(getattr(agent, "provider", "") or "codex"),
+                model_name=str(api_kwargs.get("model") or ""),
+                finalizer=_finalize_codex_stream,
+                on_stream_created=_codex_stream_created,
+                on_chunk=intercepted_events.append,
+                chunk_adapter=lambda chunk: chunk,
+                accept_chunk=_accept_codex_chunk,
+                completed_response_predicate=lambda response: bool(
+                    hasattr(response, "output") and not hasattr(response, "__iter__")
+                ),
+                metadata={
+                    "api_mode": "codex_responses",
+                    "api_request_id": getattr(agent, "_current_api_request_id", None),
+                    "call_role": (
+                        "delegated"
+                        if getattr(agent, "is_subagent", False)
+                        else "fallback"
+                        if int(getattr(agent, "_fallback_index", 0) or 0) > 0
+                        else "primary"
+                    ),
+                    "retry_count": attempt,
+                },
+                defer_logical_completion=True,
+            )
+        except (
+            _httpx.RemoteProtocolError,
+            _httpx.ReadTimeout,
+            _httpx.ConnectError,
+            ConnectionError,
+        ) as exc:
             if attempt < max_stream_retries:
                 logger.debug(
-                    "Codex Responses stream connect failed (attempt %s/%s); retrying. %s error=%s",
-                    attempt + 1, max_stream_retries + 1,
-                    agent._client_log_context(), exc,
+                    "Codex Responses stream connect failed (attempt %s/%s); "
+                    "retrying. %s error=%s",
+                    attempt + 1,
+                    max_stream_retries + 1,
+                    agent._client_log_context(),
+                    exc,
                 )
                 continue
             raise
 
-        # Claim the delta sink for THIS attempt (#65991) — parity with the
-        # chat_completions/anthropic/bedrock paths. If a prior attempt's
-        # stream is somehow still alive, this claim supersedes it so its
-        # late deltas are fenced out of the turn; conversely, a newer
-        # attempt supersedes us and the interrupt_check below stops our
-        # consumption immediately.
-        _writer_token = claim_stream_writer(agent)
-
-        def _interrupt_or_superseded(_tok=_writer_token) -> bool:
-            if agent._interrupt_requested:
-                return True
-            if not stream_writer_is_current(agent, _tok):
-                logger.warning(
-                    "Codex streaming attempt superseded by a newer stream; "
-                    "stopping consumption to preserve the single-writer "
-                    "invariant (model=%s).",
-                    api_kwargs.get("model", "unknown"),
-                )
-                return True
-            return False
+        def _interrupt_or_superseded() -> bool:
+            return bool(agent._interrupt_requested)
 
         try:
-            # Compatibility: some mocks/providers return a concrete response
-            # instead of an iterable.  Pass it straight through.
-            if hasattr(event_stream, "output") and not hasattr(event_stream, "__iter__"):
-                return event_stream
-
             try:
                 final = _consume_codex_event_stream(
                     event_stream,
@@ -1241,6 +1375,29 @@ def run_codex_stream(agent, api_kwargs: dict, client: Any = None, on_first_delta
                     )
                     continue
                 raise
+            except RuntimeError:
+                if event_stream.final_response is not None:
+                    return event_stream.final_response
+                raise
+
+            # A terminal response has already been assembled at this point
+            # (``final`` is built), so a transport error while draining the
+            # rest of the iterator — done only to let Relay run its response
+            # finalizer — must NOT discard it or trigger a new physical
+            # request. Record it as a non-fatal finalization warning and
+            # still return the already-completed, already-billed response.
+            if not agent._interrupt_requested:
+                try:
+                    for _ignored in event_stream:
+                        pass
+                except (_httpx.RemoteProtocolError, _httpx.ReadTimeout, _httpx.ConnectError, ConnectionError) as exc:
+                    logger.warning(
+                        "Codex Responses stream transport finalization failed "
+                        "after a terminal response was already received; "
+                        "returning the completed response instead of "
+                        "retrying. %s error=%s",
+                        agent._client_log_context(), exc,
+                    )
 
             if final.status in {"incomplete", "failed"}:
                 logger.warning(
@@ -1258,7 +1415,20 @@ def run_codex_stream(agent, api_kwargs: dict, client: Any = None, on_first_delta
                 try:
                     close_fn()
                 except Exception:
-                    pass
+                    # A failed close can leave this response's connection
+                    # checked out of the httpx pool while the caller's finally
+                    # reports a reuse-reason close (e.g. interrupt_check broke
+                    # the event loop with collected output) — caching the
+                    # client with the leaked connection. Poison the slot so
+                    # that close really closes the pool (owner-thread abort;
+                    # mirrors the chat-streaming interrupt-break handling).
+                    # ``client is None`` means the shared primary client,
+                    # which is never reuse-cached and must not have its
+                    # sockets force-shut here.
+                    if client is not None:
+                        agent._abort_request_openai_client(
+                            active_client, reason="codex_stream_close_failed"
+                        )
 
 
 def run_codex_create_stream_fallback(agent, api_kwargs: dict, client: Any = None):

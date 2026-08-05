@@ -1,5 +1,6 @@
-"""Regression test for #54167 — stale platform lock must be retryable.
+"""Regression tests for platform-lock acquire behavior.
 
+#54167 — stale platform lock must be retryable.
 When a gateway process is killed (SIGKILL, crash) during Telegram
 initialization, the scoped lock file survives. On next startup,
 ``acquire_scoped_lock()`` detects the stale lock and deletes it, but may
@@ -11,10 +12,11 @@ process grab the lock first).
 so the reconnect watcher can retry after a delay — not permanently kill
 the platform.
 
-Contract asserted here
-----------------------
-``_set_fatal_error`` is called with ``retryable=True`` when lock
-acquisition fails, regardless of the reason.
+#65176 — a live gateway token conflict may attempt one-shot takeover only
+during the initial connect of an explicit ``gateway run --replace`` startup.
+``gateway run --replace`` only kills same-HERMES_HOME PID-file holders.
+A normal start or reconnect must retain the retryable conflict behavior and
+must never evict the active holder.
 """
 
 from typing import Any, Dict
@@ -23,6 +25,7 @@ from unittest.mock import MagicMock, patch
 import pytest
 
 from gateway.platforms.base import BasePlatformAdapter
+from gateway.run import GatewayRunner
 
 
 class _StubAdapter(BasePlatformAdapter):
@@ -54,22 +57,14 @@ def adapter():
     obj._fatal_error_handler = None
     obj._platform_lock_scope = None
     obj._platform_lock_identity = None
-    obj._platform_lock_contention = False
+    obj._platform_lock_takeover_allowed = False
+    obj._platform_lock_takeover_attempted = False
     obj._status_write_logged = None
     return obj
 
 
 def test_stale_lock_failure_is_retryable(adapter):
-    """Lock held by a live process sets contention flag, not a fatal error.
-
-    When ``acquire_scoped_lock`` returns ``(False, existing_with_pid)``
-    it means the O_EXCL open failed because another live process holds the
-    lock.  ``_acquire_platform_lock`` treats this as **expected contention**
-    (standby mode), not a fatal error — the gateway runner checks
-    ``_platform_lock_contention`` and periodically rechecks.  Setting a
-    fatal error would bypass that standby cycle and force an unnecessary
-    reconnect loop.  Regression against #54167.
-    """
+    """Lock failure must be retryable, not permanently fatal (#54167)."""
     with patch(
         "gateway.status.acquire_scoped_lock",
         return_value=(False, {"pid": 99999, "start_time": "2026-01-01T00:00:00Z"}),
@@ -79,6 +74,35 @@ def test_stale_lock_failure_is_retryable(adapter):
         )
 
     assert result is False
-    assert adapter._platform_lock_contention is True
-    # _set_fatal_error is NOT called for live-process contention
-    assert adapter._fatal_error_code is None
+    assert adapter._fatal_error_retryable is True
+    assert adapter._fatal_error_code == "telegram-bot-token_lock"
+
+
+def test_explicit_replace_takeover_reacquires_lock_once(adapter):
+    """Initial explicit --replace may hand off and re-acquire once (#65176)."""
+    existing = {
+        "pid": 4242,
+        "kind": "hermes-gateway",
+        "argv": ["hermes", "gateway", "run"],
+        "start_time": 123,
+    }
+    acquire = MagicMock(side_effect=[(False, existing), (True, None)])
+    adapter._platform_lock_takeover_allowed = True
+
+    with patch("gateway.status.acquire_scoped_lock", acquire), patch(
+        "gateway.status.take_over_scoped_lock_holder",
+        return_value=4242,
+    ) as takeover, patch.object(
+        adapter, "_write_runtime_status_safe"
+    ):
+        result = adapter._acquire_platform_lock(
+            "telegram-bot-token", "test-token", "Telegram bot token"
+        )
+
+    assert result is True
+    assert adapter._platform_lock_takeover_allowed is False
+    assert adapter._platform_lock_takeover_attempted is True
+    takeover.assert_called_once_with(existing)
+    assert acquire.call_count == 2
+
+
