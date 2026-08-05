@@ -2,7 +2,7 @@
 
 Subcommands:
     setup    — interactive wizard: install bws, prompt for token + project, test fetch
-    status   — show current config + binary version + last fetch outcome
+    status   — show current config + binary version + token validation status
     sync     — run a fetch right now and show what would be applied (dry-run friendly)
     disable  — flip ``secrets.bitwarden.enabled`` to False
     install  — just download the bws binary (no token / project required)
@@ -11,13 +11,13 @@ Subcommands:
 from __future__ import annotations
 
 import argparse
-import getpass
+import io
 import json
 import os
 import subprocess
 import sys
 from pathlib import Path
-from typing import List, Optional, Tuple
+from typing import List, Optional
 
 from rich.console import Console
 from rich.panel import Panel
@@ -30,6 +30,7 @@ from hermes_cli.config import (
     save_config,
     save_env_value,
 )
+from hermes_cli.secret_prompt import masked_secret_prompt
 
 
 # ---------------------------------------------------------------------------
@@ -57,10 +58,37 @@ def register_cli(parent_parser: argparse.ArgumentParser) -> None:
         "--access-token",
         help="Provide the access token non-interactively (will be stored in .env)",
     )
+    setup.add_argument(
+        "--server-url",
+        help=(
+            "Bitwarden region / self-hosted endpoint. Examples: "
+            "https://vault.bitwarden.com (US, default), "
+            "https://vault.bitwarden.eu (EU), or your self-hosted URL. "
+            "Skips the interactive region prompt."
+        ),
+    )
     setup.set_defaults(func=cmd_setup)
 
-    status = sub.add_parser("status", help="Show config + binary + last fetch")
+    status = sub.add_parser(
+        "status",
+        help="Show config + binary + token validation status",
+    )
     status.set_defaults(func=cmd_status)
+
+    token = sub.add_parser(
+        "token",
+        help="Rotate the access token: validate a new one and store it in .env",
+    )
+    token.add_argument(
+        "--access-token",
+        help="Provide the new token non-interactively (default: masked prompt)",
+    )
+    token.add_argument(
+        "--no-verify",
+        action="store_true",
+        help="Store without probing Bitwarden first (not recommended)",
+    )
+    token.set_defaults(func=cmd_token)
 
     sync = sub.add_parser("sync", help="Fetch secrets now and report what changed")
     sync.add_argument(
@@ -121,6 +149,29 @@ def cmd_setup(args: argparse.Namespace) -> int:
         )
         return 1
 
+    # -- non-interactive guard --
+    if not sys.stdin.isatty():
+        missing = []
+        if not (args.access_token and args.access_token.strip()):
+            missing.append("--access-token")
+        if not (args.server_url and args.server_url.strip()):
+            # Also accept BWS_SERVER_URL env var as non-interactive substitute
+            if not os.environ.get("BWS_SERVER_URL", "").strip():
+                missing.append("--server-url")
+        if not (args.project_id and args.project_id.strip()):
+            missing.append("--project-id")
+        if missing:
+            console.print(
+                f"  [red]Non-interactive mode (no TTY) requires all setup flags.[/red]\n"
+                f"  Missing: {', '.join(missing)}\n\n"
+                "  Usage:\n"
+                "    hermes secrets bitwarden setup \\\n"
+                "      --access-token '0.xxx' \\\n"
+                "      --server-url 'https://vault.bitwarden.com' \\\n"
+                "      --project-id 'xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx'"
+            )
+            return 1
+
     # ------------------------------------------------------------------- token
     console.print()
     console.print("[bold]Step 2[/bold]  Provide your access token")
@@ -131,7 +182,7 @@ def cmd_setup(args: argparse.Namespace) -> int:
 
     token = (args.access_token or "").strip()
     if not token:
-        token = getpass.getpass(f"  Paste access token ({token_env}): ").strip()
+        token = masked_secret_prompt(f"  Paste access token ({token_env}): ").strip()
     if not token:
         console.print("  [red]Empty token, aborting.[/red]")
         return 1
@@ -145,14 +196,28 @@ def cmd_setup(args: argparse.Namespace) -> int:
     os.environ[token_env] = token  # so the test fetch below sees it
     console.print(f"  [green]✓[/green] stored in {get_env_path()} as {token_env}")
 
+    # ------------------------------------------------------------------ region
+    console.print()
+    console.print("[bold]Step 3[/bold]  Pick a Bitwarden region")
+    server_url = _resolve_server_url(args, secrets_cfg, console)
+    if server_url is None:
+        return 1
+    if server_url:
+        console.print(f"  [green]✓[/green] using {server_url}")
+    else:
+        console.print(
+            "  [green]✓[/green] using bws default "
+            "(US Cloud, https://vault.bitwarden.com)"
+        )
+
     # ------------------------------------------------------------------- project
     if args.project_id and args.project_id.strip():
         project_id = args.project_id.strip()
     else:
         console.print()
-        console.print("[bold]Step 3[/bold]  Pick a project")
+        console.print("[bold]Step 4[/bold]  Pick a project")
         project_id = ""
-        projects = _list_projects(binary, token, console)
+        projects = _list_projects(binary, token, console, server_url=server_url)
         if projects is None:
             return 1
         if not projects:
@@ -187,7 +252,7 @@ def cmd_setup(args: argparse.Namespace) -> int:
 
     # ------------------------------------------------------------------- test
     console.print()
-    step_num = 4 if not (args.project_id and args.project_id.strip()) else 3
+    step_num = 5 if not (args.project_id and args.project_id.strip()) else 4
     console.print(f"[bold]Step {step_num}[/bold]  Test fetch")
     try:
         secrets, warnings = bw.fetch_bitwarden_secrets(
@@ -195,6 +260,7 @@ def cmd_setup(args: argparse.Namespace) -> int:
             project_id=project_id,
             binary=binary,
             use_cache=False,
+            server_url=server_url,
         )
     except Exception as exc:  # noqa: BLE001
         console.print(f"  [red]✗ Fetch failed: {exc}[/red]")
@@ -221,6 +287,7 @@ def cmd_setup(args: argparse.Namespace) -> int:
     # ------------------------------------------------------------------- save
     secrets_cfg["enabled"] = True
     secrets_cfg["project_id"] = project_id
+    secrets_cfg["server_url"] = server_url
     secrets_cfg.setdefault("access_token_env", token_env)
     secrets_cfg.setdefault("cache_ttl_seconds", 300)
     secrets_cfg.setdefault("override_existing", True)
@@ -248,7 +315,16 @@ def cmd_status(args: argparse.Namespace) -> int:
     enabled = bool(bw_cfg.get("enabled"))
     token_env = bw_cfg.get("access_token_env", "BWS_ACCESS_TOKEN")
     project_id = bw_cfg.get("project_id", "")
-    token_set = bool(os.environ.get(token_env))
+    server_url = str(bw_cfg.get("server_url", "") or "").strip()
+    token = os.environ.get(token_env, "").strip()
+    token_set = bool(token)
+    binary = bw.find_bws(install_if_missing=False)
+    token_validation, validation_messages = _token_validation_status(
+        enabled=enabled,
+        binary=binary,
+        token=token,
+        server_url=server_url,
+    )
 
     table = Table(show_header=False, box=None, padding=(0, 2))
     table.add_column("", style="bold")
@@ -256,18 +332,24 @@ def cmd_status(args: argparse.Namespace) -> int:
     table.add_row("Enabled",         _yn(enabled))
     table.add_row("Token env var",   token_env)
     table.add_row("Token in env",    _yn(token_set))
+    table.add_row("Token validation", token_validation)
     table.add_row("Project ID",      project_id or "[dim](unset)[/dim]")
+    table.add_row(
+        "Server URL",
+        server_url or "[dim]default (US Cloud, https://vault.bitwarden.com)[/dim]",
+    )
     table.add_row("Override existing", _yn(bool(bw_cfg.get("override_existing", False))))
     table.add_row("Cache TTL (s)",   str(bw_cfg.get("cache_ttl_seconds", 300)))
     table.add_row("Auto-install",    _yn(bool(bw_cfg.get("auto_install", True))))
 
-    binary = bw.find_bws(install_if_missing=False)
     if binary:
         table.add_row("bws binary",  f"{binary} ({_bws_version(binary)})")
     else:
         table.add_row("bws binary",  "[yellow]not installed[/yellow]")
 
     console.print(Panel(table, title="Bitwarden Secrets Manager", border_style="cyan"))
+    for message in validation_messages:
+        console.print(message)
 
     if not enabled:
         console.print("\n  Run [cyan]hermes secrets bitwarden setup[/cyan] to enable.")
@@ -280,6 +362,87 @@ def cmd_status(args: argparse.Namespace) -> int:
     if not project_id:
         console.print(
             "\n  [yellow]Enabled but no project_id — nothing to fetch.[/yellow]"
+        )
+    return 0
+
+
+def cmd_token(args: argparse.Namespace) -> int:
+    """Rotate the BSM access token without re-running the whole setup wizard.
+
+    Prompts for (or accepts via ``--access-token``) a new machine-account
+    token, probes Bitwarden with it (unless ``--no-verify``), and only then
+    persists it to .env — so a bad paste never bricks the working token.
+    """
+    console = Console()
+    cfg = load_config()
+    bw_cfg = (cfg.get("secrets") or {}).get("bitwarden") or {}
+    token_env = bw_cfg.get("access_token_env", "BWS_ACCESS_TOKEN")
+    server_url = str(bw_cfg.get("server_url", "") or "").strip()
+
+    token = (args.access_token or "").strip()
+    if not token:
+        if not sys.stdin.isatty():
+            console.print(
+                "[red]No TTY — pass the token with --access-token.[/red]"
+            )
+            return 1
+        console.print(
+            "Create a new token in the Bitwarden web app:\n"
+            "  Secrets Manager → Machine accounts → [your account] → "
+            "Access tokens → Create access token\n"
+        )
+        token = masked_secret_prompt(f"Paste new access token ({token_env}): ").strip()
+    if not token:
+        console.print("[red]Empty token, aborting.[/red]")
+        return 1
+    if not token.startswith("0."):
+        console.print(
+            "[yellow]Warning: token doesn't start with '0.' — usually that means "
+            "you pasted something other than a BSM access token.[/yellow]"
+        )
+
+    if not args.no_verify:
+        binary = bw.find_bws(install_if_missing=True)
+        if binary is None:
+            console.print(
+                "[red]bws binary not available — cannot verify.  "
+                "Re-run with --no-verify to store anyway.[/red]"
+            )
+            return 1
+        console.print("Verifying against Bitwarden…")
+        projects = _list_projects(binary, token, console, server_url=server_url)
+        if projects is None:
+            console.print(
+                "[red]✗ New token was rejected — nothing was changed.[/red]"
+            )
+            return 1
+        console.print(
+            f"[green]✓ Token accepted[/green] "
+            f"({len(projects)} project{'s' if len(projects) != 1 else ''} visible)."
+        )
+        project_id = str(bw_cfg.get("project_id", "") or "")
+        if project_id and projects and project_id not in {p["id"] for p in projects}:
+            console.print(
+                f"[yellow]Warning: configured project {project_id} is not visible "
+                "to this machine account.  Grant it access in the Bitwarden web "
+                "app or re-run `hermes secrets bitwarden setup` to pick a "
+                "different project.[/yellow]"
+            )
+
+    save_env_value(token_env, token)
+    os.environ[token_env] = token
+    # Old cached pulls are keyed on the previous token's fingerprint; drop
+    # them so the next startup fetches fresh with the new credential.
+    bw.clear_caches()
+    console.print(
+        f"[green]✓[/green] stored in {get_env_path()} as {token_env}.  "
+        "Takes effect on the next Hermes invocation."
+    )
+    if not bw_cfg.get("enabled"):
+        console.print(
+            "[yellow]Note: the Bitwarden integration is currently disabled — "
+            "run `hermes secrets bitwarden setup` (or set "
+            "secrets.bitwarden.enabled: true) to turn it on.[/yellow]"
         )
     return 0
 
@@ -306,11 +469,14 @@ def cmd_sync(args: argparse.Namespace) -> int:
         console.print("[red]No project_id configured.[/red]")
         return 1
 
+    server_url = str(bw_cfg.get("server_url", "") or "").strip()
+
     try:
         secrets, warnings = bw.fetch_bitwarden_secrets(
             access_token=token,
             project_id=project_id,
             use_cache=False,
+            server_url=server_url,
         )
     except Exception as exc:  # noqa: BLE001
         console.print(f"[red]Fetch failed: {exc}[/red]")
@@ -396,7 +562,7 @@ def _bws_version(binary: Path) -> str:
         res = subprocess.run(
             [str(binary), "--version"],
             capture_output=True,
-            text=True,
+            text=True, encoding='utf-8', errors='replace',
             timeout=5,
         )
         if res.returncode == 0:
@@ -406,19 +572,56 @@ def _bws_version(binary: Path) -> str:
     return "version unknown"
 
 
+def _token_validation_status(
+    *,
+    enabled: bool,
+    binary: Optional[Path],
+    token: str,
+    server_url: str = "",
+) -> tuple[str, list[str]]:
+    if not enabled:
+        return "[dim]not checked[/dim] (integration disabled)", []
+    if not token:
+        return "[dim]not checked[/dim] (token missing)", []
+    if binary is None:
+        return "[dim]not checked[/dim] (bws not installed)", []
+
+    messages: list[str] = []
+    if not token.startswith("0."):
+        messages.append(
+            "  [yellow]Warning: token doesn't start with '0.' — usually that means "
+            "you pasted something other than a BSM access token.  Continuing anyway.[/yellow]"
+        )
+
+    capture = io.StringIO()
+    probe_console = Console(file=capture, record=True, width=200)
+    projects = _list_projects(binary, token, probe_console, server_url=server_url)
+    if projects is None:
+        details = probe_console.export_text(styles=False).strip()
+        if details:
+            messages.extend(line.rstrip() for line in details.splitlines())
+        return "[red]failed[/red]", messages
+    return "[green]passed[/green]", messages
+
+
 def _list_projects(
-    binary: Path, token: str, console: Console
+    binary: Path, token: str, console: Console, *, server_url: str = ""
 ) -> Optional[List[dict]]:
     """Call ``bws project list`` and return the parsed list, or None on failure."""
-    env = os.environ.copy()
+    # Secret-manager CLI child: intentionally receives tokens — no scrub,
+    # no HOME rewrite (bws stores state under the real user home).
+    from tools.environments.local import build_subprocess_env
+    env = build_subprocess_env(scrub_secrets=False, inherit_profile_home=False)
     env["BWS_ACCESS_TOKEN"] = token
     env.setdefault("NO_COLOR", "1")
+    if server_url:
+        env["BWS_SERVER_URL"] = server_url
     try:
         res = subprocess.run(
             [str(binary), "project", "list", "--output", "json"],
             env=env,
             capture_output=True,
-            text=True,
+            text=True, encoding='utf-8', errors='replace',
             timeout=15,
         )
     except (OSError, subprocess.TimeoutExpired) as exc:
@@ -428,7 +631,16 @@ def _list_projects(
     if res.returncode != 0:
         err = (res.stderr or res.stdout).strip()[:300]
         console.print(f"  [red]bws project list failed: {err}[/red]")
-        if "authorization" in err.lower() or "invalid" in err.lower():
+        lowered = err.lower()
+        if "invalid_client" in lowered or "400 bad request" in lowered:
+            console.print(
+                "  [yellow]'invalid_client' from the US identity endpoint usually "
+                "means the token is for a different Bitwarden region.  Re-run "
+                "[cyan]hermes secrets bitwarden setup[/cyan] and pick EU or "
+                "self-hosted at the region prompt, or set [cyan]secrets.bitwarden."
+                "server_url[/cyan] in config.yaml.[/yellow]"
+            )
+        elif "authorization" in lowered or "invalid" in lowered:
             console.print(
                 "  [yellow]This usually means the access token is wrong or revoked. "
                 "Double-check it in the Bitwarden web app.[/yellow]"
@@ -443,3 +655,91 @@ def _list_projects(
     if not isinstance(data, list):
         return []
     return [p for p in data if isinstance(p, dict) and p.get("id")]
+
+
+# Canonical Bitwarden region endpoints.  Keep in sync with what Bitwarden
+# publishes — these are stable but if a third region appears, add it here
+# and to the prompt below.
+_REGION_PRESETS = [
+    ("US Cloud  (https://vault.bitwarden.com — bws default)", ""),
+    ("EU Cloud  (https://vault.bitwarden.eu)", "https://vault.bitwarden.eu"),
+]
+
+
+def _resolve_server_url(
+    args: argparse.Namespace,
+    secrets_cfg: dict,
+    console: Console,
+) -> Optional[str]:
+    """Pick a Bitwarden server URL for setup.
+
+    Resolution order:
+      1. ``--server-url`` CLI flag (non-interactive)
+      2. ``BWS_SERVER_URL`` env var (so users running with that already set
+         in their shell don't have to re-enter it)
+      3. Existing ``secrets.bitwarden.server_url`` value (for re-runs)
+      4. Interactive menu: US / EU / self-hosted
+
+    Returns the chosen URL as a string (empty string = bws default,
+    i.e. US Cloud).  Returns None if the user aborted with an empty
+    custom URL.
+    """
+    if args.server_url and args.server_url.strip():
+        return args.server_url.strip()
+
+    env_url = os.environ.get("BWS_SERVER_URL", "").strip()
+    if env_url:
+        console.print(
+            f"  Detected [cyan]BWS_SERVER_URL[/cyan]={env_url} in your shell — using it."
+        )
+        return env_url
+
+    existing = str(secrets_cfg.get("server_url", "") or "").strip()
+    if existing:
+        console.print(
+            f"  Existing config: [cyan]{existing}[/cyan]. "
+            "Press Enter to keep, or pick a different option below."
+        )
+
+    table = Table(show_header=True, header_style="bold", box=None, padding=(0, 2))
+    table.add_column("#", style="cyan", width=4)
+    table.add_column("Region / endpoint")
+    for i, (label, _url) in enumerate(_REGION_PRESETS, 1):
+        table.add_row(str(i), label)
+    table.add_row(str(len(_REGION_PRESETS) + 1), "Self-hosted / custom URL")
+    console.print(table)
+
+    custom_idx = len(_REGION_PRESETS) + 1
+    while True:
+        prompt = f"  Select region [1-{custom_idx}]"
+        if existing:
+            prompt += " (Enter to keep current)"
+        prompt += ": "
+        choice = console.input(prompt).strip()
+        if not choice:
+            if existing:
+                return existing
+            console.print("  [red]Enter a number.[/red]")
+            continue
+        try:
+            idx = int(choice)
+        except ValueError:
+            console.print("  [red]Enter a number.[/red]")
+            continue
+        if 1 <= idx <= len(_REGION_PRESETS):
+            return _REGION_PRESETS[idx - 1][1]
+        if idx == custom_idx:
+            custom = console.input(
+                "  Enter your Bitwarden server URL "
+                "(e.g. https://vault.example.com): "
+            ).strip()
+            if not custom:
+                console.print("  [red]Empty URL, aborting.[/red]")
+                return None
+            if not custom.startswith(("http://", "https://")):
+                console.print(
+                    "  [yellow]Warning: URL doesn't start with http:// or "
+                    "https:// — bws may reject it.[/yellow]"
+                )
+            return custom
+        console.print(f"  [red]Out of range — pick 1-{custom_idx}.[/red]")

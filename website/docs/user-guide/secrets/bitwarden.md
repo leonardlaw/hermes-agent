@@ -21,7 +21,7 @@ You set up the machine account *in the web app*, where your normal 2FA applies. 
 
 ### 1. Create a machine account and access token
 
-In the [Bitwarden web app](https://vault.bitwarden.com):
+In the [Bitwarden web app](https://vault.bitwarden.com) (or [vault.bitwarden.eu](https://vault.bitwarden.eu) for EU accounts):
 
 1. Switch to **Secrets Manager** from the product switcher.
 2. Create or pick a **Project** (e.g. "Hermes keys").
@@ -41,9 +41,19 @@ It will:
 
 1. Download and verify `bws v2.0.0` into `~/.hermes/bin/bws`.
 2. Prompt you for the access token (input is hidden). Stored in `~/.hermes/.env` as `BWS_ACCESS_TOKEN`.
-3. List the projects the machine account can see; pick one. Stored in `config.yaml` as `secrets.bitwarden.project_id`.
-4. Test-fetch the project's secrets and show you which env vars will resolve.
-5. Flip `secrets.bitwarden.enabled: true`.
+3. Ask which Bitwarden region your machine account belongs to — **US Cloud**, **EU Cloud**, or **self-hosted / custom URL**. Stored in `config.yaml` as `secrets.bitwarden.server_url` and passed to `bws` as `BWS_SERVER_URL`.
+4. List the projects the machine account can see; pick one. Stored in `config.yaml` as `secrets.bitwarden.project_id`.
+5. Test-fetch the project's secrets and show you which env vars will resolve.
+6. Flip `secrets.bitwarden.enabled: true`.
+
+Non-interactive setup is also supported via flags:
+
+```bash
+hermes secrets bitwarden setup \
+  --access-token "$BWS_ACCESS_TOKEN" \
+  --server-url https://vault.bitwarden.eu \
+  --project-id <project-uuid>
+```
 
 ### 3. Confirm
 
@@ -58,11 +68,30 @@ From now on, every `hermes` invocation pulls fresh secrets at startup. You'll se
 | Command | What it does |
 |---|---|
 | `hermes secrets bitwarden setup` | Interactive wizard (install binary, prompt for token, pick project, test fetch) |
-| `hermes secrets bitwarden status` | Show config + binary version + token presence |
+| `hermes secrets bitwarden status` | Show config + binary version + token presence/validation |
+| `hermes secrets bitwarden token` | Rotate the access token: validate the new token against Bitwarden, then store it in `.env` |
 | `hermes secrets bitwarden sync` | Dry-run: pull secrets now and show what would be applied |
 | `hermes secrets bitwarden sync --apply` | Pull and export into the current shell's environment |
 | `hermes secrets bitwarden install` | Just download the pinned `bws` binary (no auth required) |
 | `hermes secrets bitwarden disable` | Flip `enabled: false`; leaves token + project id in place |
+
+## Rotating an expired or revoked token
+
+When the machine-account token expires, gets revoked, or the account is deleted, startup shows:
+
+```
+Bitwarden Secrets Manager: Bitwarden rejected the machine-account access token (BWS_ACCESS_TOKEN) — it was likely revoked, expired, or belongs to another region.  (...)
+Bitwarden Secrets Manager: → Run `hermes secrets bitwarden token` to paste a fresh access token ...
+```
+
+Fix it without re-running the whole wizard:
+
+```bash
+hermes secrets bitwarden token                     # masked prompt
+hermes secrets bitwarden token --access-token 0.…  # non-interactive
+```
+
+The command probes Bitwarden with the new token **before** writing anything — a rejected token leaves your current `.env` untouched. On success it stores the token, clears the fetch caches, and warns if the configured project is not visible to the new machine account.
 
 ## Configuration
 
@@ -74,7 +103,11 @@ secrets:
     enabled: false
     access_token_env: BWS_ACCESS_TOKEN
     project_id: ""
+    server_url: ""
     cache_ttl_seconds: 300
+    encrypted_cache:
+      enabled: false
+      max_stale_seconds: 0
     override_existing: true
     auto_install: true
 ```
@@ -84,7 +117,10 @@ secrets:
 | `enabled` | `false` | Master switch. When false, Bitwarden is never contacted. |
 | `access_token_env` | `BWS_ACCESS_TOKEN` | Env var name that holds the bootstrap token. Change this if you already use `BWS_ACCESS_TOKEN` for something else. |
 | `project_id` | `""` | UUID of the project to sync from. |
-| `cache_ttl_seconds` | `300` | How long an in-process fetch result is reused. Set to `0` to disable caching. Cache is per-process; new `hermes` invocations start fresh. |
+| `server_url` | `""` | Bitwarden region or self-hosted endpoint. Empty = `bws` default (US Cloud, `https://vault.bitwarden.com`). Set to `https://vault.bitwarden.eu` for EU Cloud, or your own URL for self-hosted. Plumbed into the `bws` subprocess as `BWS_SERVER_URL`. |
+| `cache_ttl_seconds` | `300` | How long an in-process or disk fetch result is reused. Set to `0` to disable fresh-cache reuse. |
+| `encrypted_cache.enabled` | `false` | Store the last successful fetch in an AES-GCM encrypted cache at `~/.hermes/cache/bws_cache.enc.json`. |
+| `encrypted_cache.max_stale_seconds` | `0` | When encrypted caching is enabled, allow that cache to be used only after network/timeout failures, up to this age. Authentication failures never use stale secrets. A successful encrypted write removes the legacy plaintext `cache/bws_cache.json`. |
 | `override_existing` | `true` | When true, Bitwarden values overwrite anything already in env (so rotation in the web app actually takes effect). Flip to `false` if you want `.env` / shell exports to win locally. |
 | `auto_install` | `true` | When true, `bws` is auto-downloaded into `~/.hermes/bin/` on first use. |
 
@@ -95,10 +131,13 @@ Bitwarden never blocks Hermes startup. If anything goes wrong, you'll see a one-
 | Symptom | Cause | Fix |
 |---|---|---|
 | `BWS_ACCESS_TOKEN is not set` | Enabled in config but token cleared from `.env` | Re-run `hermes secrets bitwarden setup` |
-| `bws exited 1: invalid access token` | Token revoked or wrong | Generate a new token, re-run setup |
-| `bws timed out` | Network blocked or Bitwarden API slow | Check connectivity to `api.bitwarden.com` |
+| `Bitwarden rejected the machine-account access token … invalid_client` | Token revoked, expired, machine account deleted — or the token belongs to another region (e.g. EU token hitting the US identity endpoint) | Run `hermes secrets bitwarden token` to paste a fresh token; for region mismatches re-run setup and pick EU/self-hosted (or set `secrets.bitwarden.server_url`) |
+| `bws exited 1: invalid access token` | Token revoked or wrong | Run `hermes secrets bitwarden token` with a new token |
+| `bws timed out` | Network blocked or Bitwarden API slow | Check connectivity to `api.bitwarden.com` (or your `server_url`) |
 | `bws binary not available` | `auto_install: false` and `bws` not on PATH | Install manually from [github.com/bitwarden/sdk-sm/releases](https://github.com/bitwarden/sdk-sm/releases) or flip `auto_install` back on |
 | `Checksum mismatch` | Download corrupted or tampered | Re-run, will retry; if it persists, file an issue |
+
+Startup warnings now include a `→` remediation line telling you exactly which command fixes the failure.
 
 ## Security notes
 
