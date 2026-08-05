@@ -1730,6 +1730,17 @@ _TRANSIENT_TRANSPORT_ERRORS = frozenset({
     "ReadTimeout", "ConnectTimeout", "PoolTimeout",
     "ConnectError", "RemoteProtocolError",
     "APIConnectionError", "APITimeoutError",
+    # Connection-level errors from load-balancer-side idle disconnects.
+    # The opencode.ai load balancer closes idle TCP connections server-side
+    # without sending FIN — the client's httpx pool doesn't discover this
+    # until the next write, producing [Errno 32] Broken pipe (#a8fa1329).
+    # Including these here lets try_recover_primary_transport rebuild the
+    # httpx client (fresh connection pool) and retry once before falling
+    # back, instead of burning all retry budget on the stale pool.
+    "BrokenPipeError",
+    "ConnectionResetError",
+    "ConnectionAbortedError",
+    "ServerDisconnectedError",
 })
 
 

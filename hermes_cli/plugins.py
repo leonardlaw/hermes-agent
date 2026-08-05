@@ -1301,6 +1301,10 @@ class PluginManager:
         self._plugin_commands: Dict[str, dict] = {}  # Slash commands registered by plugins
         self._discovered: bool = False
         self._cli_ref = None  # Set by CLI after plugin discovery
+        # Tracks plugin names whose load failure has already been logged
+        # this process lifetime. Used to suppress repeat warnings so a
+        # missing plugin module doesn't flood the log on every restart.
+        self._logged_plugin_failures: Set[str] = set()
         # Plugin skill registry: qualified name → metadata dict.
         self._plugin_skills: Dict[str, Dict[str, Any]] = {}
         # Plugin-registered auxiliary tasks: key → {key, display_name,
@@ -1865,10 +1869,18 @@ class PluginManager:
 
         except Exception as exc:
             loaded.error = str(exc)
-            logger.warning(
-                "Failed to load plugin '%s': %s",
-                manifest.name, exc, exc_info=_PLUGINS_DEBUG,
-            )
+            plugin_name = manifest.name or manifest.key or ""
+            if plugin_name not in self._logged_plugin_failures:
+                self._logged_plugin_failures.add(plugin_name)
+                logger.warning(
+                    "Failed to load plugin '%s': %s",
+                    plugin_name, exc, exc_info=_PLUGINS_DEBUG,
+                )
+            else:
+                logger.debug(
+                    "Failed to load plugin '%s' (suppressed, first failure already logged): %s",
+                    plugin_name, exc,
+                )
         self._plugins[manifest.key or manifest.name] = loaded
 
     def _load_directory_module(self, manifest: PluginManifest) -> types.ModuleType:

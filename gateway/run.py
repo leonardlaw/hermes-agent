@@ -11020,17 +11020,33 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     )
                     logger.info("✓ %s connected", platform.value)
                 else:
-                    logger.warning("✗ %s failed to connect", platform.value)
-                    # Defensive cleanup: a failed connect() may have
-                    # allocated resources (aiohttp.ClientSession, poll
-                    # tasks, bridge subprocesses) before giving up.
-                    # Without this call, those resources are orphaned
-                    # and Python logs "Unclosed client session" at
-                    # process exit. Adapter disconnect() implementations
-                    # are expected to be idempotent and tolerate
-                    # partial-init state.
-                    await self._safe_adapter_disconnect(adapter, platform)
-                    if adapter.has_fatal_error:
+                    lock_contention = getattr(adapter, '_platform_lock_contention', False)
+                    if lock_contention:
+                        # Another live gateway instance holds the bot-token poll
+                        # lock.  This is expected when multiple profiles share the
+                        # same credential.  Gracefully degrade: log at INFO, show
+                        # "standby" status, and periodically re-check so takeover
+                        # works if the primary gateway stops.
+                        logger.info(
+                            "⊘ %s in standby mode — poll lock held by another "
+                            "gateway instance (will re-check every 5 min)",
+                            platform.value,
+                        )
+                        self._update_platform_runtime_status(
+                            platform.value,
+                            platform_state="standby",
+                            error_code=None,
+                            error_message="poll lock held by another gateway (standby)",
+                        )
+                        # Slow re-check: 300s (no aggressive backoff needed since
+                        # this is expected multi-profile contention, not a failure).
+                        self._failed_platforms[platform] = {
+                            "config": platform_config,
+                            "attempts": 1,
+                            "next_retry": time.monotonic() + 300,
+                            "_lock_contention": True,
+                        }
+                    elif adapter.has_fatal_error:
                         self._update_platform_runtime_status(
                             platform.value,
                             platform_state="retrying" if adapter.fatal_error_retryable else "fatal",
@@ -11059,6 +11075,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                                 ),
                             }
                     else:
+                        logger.warning("✗ %s failed to connect", platform.value)
                         self._update_platform_runtime_status(
                             platform.value,
                             platform_state="retrying",
@@ -11080,6 +11097,20 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                                 platform, adapter
                             ),
                         }
+                    # Defensive cleanup: a failed connect() may have
+                    # allocated resources (aiohttp.ClientSession, poll
+                    # tasks, bridge subprocesses) before giving up.
+                    # Without this call, those resources are orphaned
+                    # and Python logs "Unclosed client session" at
+                    # process exit. Adapter disconnect() implementations
+                    # are expected to be idempotent and tolerate
+                    # partial-init state.
+                    # NOTE: safe_adapter_disconnect is called AFTER the
+                    # lock_contention check above because _platform_lock_contention
+                    # is an attribute on the adapter; the disconnection may clear
+                    # it.  Capture the flag value before cleanup.
+                    if lock_contention:
+                        await self._safe_adapter_disconnect(adapter, platform)
             except Exception as e:
                 logger.error("✗ %s error: %s", platform.value, e)
                 # Same defensive cleanup path for exceptions — an adapter

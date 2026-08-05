@@ -91,6 +91,12 @@ class ClassifiedError:
     should_compress: bool = False
     should_rotate_credential: bool = False
     should_fallback: bool = False
+    # Stream-specific flag: True when the error is a known stale-stream or
+    # transport-level timeout signature (BrokenPipe, RemoteProtocolError,
+    # stream stale messages, etc.).  The outer retry loop can use a shorter
+    # backoff (2-3s base, 30s cap) when this is set, since the failure is
+    # a transient prefill/connection hiccup rather than server overload.
+    is_stream_stale: bool = False
 
     @property
     def is_auth(self) -> bool:
@@ -534,6 +540,28 @@ _SERVER_DISCONNECT_PATTERNS = [
     "incomplete chunked read",
 ]
 
+# Stream-stale / broken-pipe patterns — transient connection-level
+# failures that indicate the upstream provider's gateway or proxy
+# closed an idle connection.  Common on opencode-go's shared
+# infrastructure where keepalive timeouts and load-balancer resets
+# close connections mid-stream.  When detected, the retry loop should
+# use shorter backoff (2-5s) and prefer provider fallback over
+# repeated retries on the same backend.
+_STREAM_STALE_PATTERNS = [
+    "broken pipe",
+    "broken_pipe",
+    "stale stream",
+    "stream stale",
+    "connection lost",
+    "connection reset",
+    "connection closed",
+    "connection terminated",
+    "peer closed connection",
+    "peer closed",
+    "upstream connect error",
+]
+
+
 # SSL certificate verification failures — deterministic, NOT transient.
 #
 # A failed certificate chain (TLS-inspecting corporate proxy, missing
@@ -554,7 +582,6 @@ _SSL_CERT_VERIFY_PATTERNS = [
     "self signed certificate",
     "certificate has expired",
     "hostname mismatch, certificate is not valid",
-    "unable to verify the first certificate",  # Node/undici phrasing (MCP bridges)
 ]
 
 # SSL/TLS transient failure patterns — intentionally distinct from
@@ -924,8 +951,7 @@ def classify_api_error(
         # agent/reasoning_timeouts.py raises the stale-detector
         # threshold to tolerate long thinking, so a true
         # transport-layer failure here is recoverable via the retry
-        # path — not via context compression.  Reclassify as timeout.
-        # (Part 1 of Fixes #52310.)
+        # path — not via context compression.  (Part 1 of Fixes #52310.)
         from agent.reasoning_timeouts import get_reasoning_stale_timeout_floor
         if get_reasoning_stale_timeout_floor(model) is not None:
             return _result(FailoverReason.timeout, retryable=True)
@@ -941,7 +967,13 @@ def classify_api_error(
                 retryable=True,
                 should_compress=True,
             )
-        return _result(FailoverReason.timeout, retryable=True)
+        # Check for stream-stale patterns on this disconnect so the
+        # retry loop can use shorter backoff even when the error was
+        # caught by the disconnect heuristic instead of the generic
+        # transport bucket (step 7).
+        _sd_stale = any(p in error_msg for p in _STREAM_STALE_PATTERNS)
+        return _result(FailoverReason.timeout, retryable=True,
+                       is_stream_stale=_sd_stale)
 
     # ── 7b. Stale-call circuit breaker → failover immediately ──────
     # _check_stale_giveup() in agent/chat_completion_helpers.py raises a
@@ -967,8 +999,17 @@ def classify_api_error(
 
     # ── 8. Transport / timeout heuristics ───────────────────────────
 
+    # Check for stream-stale / broken-pipe patterns on any transport error
+    # so the retry loop can use shorter backoff.  Apply across all transport
+    # error types — the key signal is whether the error message matches
+    # connection-level closure patterns, not the specific exception class.
+    _matched_stale_pattern = any(p in error_msg for p in _STREAM_STALE_PATTERNS)
+
     if error_type in _TRANSPORT_ERROR_TYPES or isinstance(error, (TimeoutError, ConnectionError, OSError)):
-        return _result(FailoverReason.timeout, retryable=True)
+        return _result(
+            FailoverReason.timeout, retryable=True,
+            is_stream_stale=_matched_stale_pattern,
+        )
 
     # ── 9. Fallback: unknown ────────────────────────────────────────
 
@@ -1125,6 +1166,21 @@ def _classify_by_status(
             context_length=context_length,
             num_messages=num_messages,
             result_fn=result_fn,
+        )
+
+    # Cloudflare origin / proxy errors — transport-layer failures
+    # from Cloudflare's edge indicating the upstream origin is
+    # unreachable, returning corrupted responses (520), down (521),
+    # or timing out (524).  Classify as timeout to trigger retry
+    # with fallback, rather than the generic 5xx->server_error path
+    # which doesn't set should_fallback.  This lets the retry loop
+    # fail over to OpenRouter on transient opencode-go origin issues
+    # instead of burning all retries on the dead upstream.
+    if status_code in {520, 521, 524}:
+        return result_fn(
+            FailoverReason.timeout,
+            retryable=True,
+            should_fallback=True,
         )
 
     if status_code in {500, 502}:

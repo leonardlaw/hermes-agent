@@ -1408,6 +1408,19 @@ def init_agent(
             print(f"🔄 Fallback chain ({len(agent._fallback_chain)} providers): " +
                   " → ".join(f"{f['model']} ({f['provider']})" for f in agent._fallback_chain))
 
+    # Dead-provider registry: SQLite-backed store that tracks provider/model
+    # pairs that have been marked dead after repeated call failures.
+    from agent.dead_provider_registry import DeadProviderRegistry
+
+    agent._dead_registry = None
+    try:
+        agent._dead_registry = DeadProviderRegistry()
+    except Exception as _dpr_err:
+        _ra().logger.warning(
+            "Failed to initialise dead-provider registry: %s", _dpr_err,
+        )
+        agent._dead_registry = None
+
     # Get available tools with filtering. Capture the registry generation this
     # snapshot is derived from FIRST, so a later concurrent refresh can tell
     # whether it holds a newer or staler view (see refresh_agent_mcp_tools).

@@ -66,6 +66,9 @@ class TurnRetryState:
     # ── Transport / rate-limit recovery ──────────────────────────────────
     primary_recovery_attempted: bool = False
     has_retried_429: bool = False
+    # Transport-error failover: set once we've escalated a persistent
+    # Broken pipe / connection-reset / timeout to the fallback chain.
+    transport_failover_attempted: bool = False
 
     # ── Auth-failure provider failover ───────────────────────────────────
     # Set once we've escalated a persistent 401/403 (after the per-provider

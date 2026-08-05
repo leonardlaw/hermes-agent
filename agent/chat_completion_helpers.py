@@ -29,6 +29,10 @@ from typing import Any, Dict, Optional
 
 from hermes_cli.timeouts import get_provider_request_timeout, get_provider_stale_timeout
 from hermes_constants import PARTIAL_STREAM_STUB_ID, FINISH_REASON_LENGTH
+from agent.stream_circuit_breaker import (
+    record_stream_failure as _record_stream_failure,
+    record_stream_success as _record_stream_success,
+)
 from agent.error_classifier import FailoverReason
 from agent.errors import EmptyStreamError
 from agent.turn_context import substitute_api_content
@@ -1071,6 +1075,15 @@ def interruptible_api_call(agent, api_kwargs: dict):
             # Circuit breaker (#58962): count the stale kill.  See the
             # canonical comment block above ``_stale_streak()``.
             _bump_stale_streak(agent)
+            # Also count it in the global (provider, model) circuit breaker
+            # so non-streaming stale kills trip the breaker just like
+            # streaming failures do.
+            _record_stream_failure(
+                agent,
+                getattr(agent, "provider", ""),
+                getattr(agent, "model", ""),
+                f"stale_non_stream: {int(_elapsed)}s",
+            )
             agent._touch_activity(
                 f"stale non-streaming call killed after {int(_elapsed)}s"
             )
@@ -1110,12 +1123,43 @@ def interruptible_api_call(agent, api_kwargs: dict):
             except Exception:
                 pass
             raise InterruptedError("Agent interrupted during API call")
+    # ── Record provider metric ──────────────────────────────────────
+    _record_latency = (time.time() - _call_start) * 1000
+    try:
+        from agent.provider_health_monitor import record_api_call
+        _rec_provider = str(getattr(agent, "provider", "") or "")
+        _rec_model = str(getattr(agent, "model", "") or "")
+        if result["error"] is not None:
+            record_api_call(
+                provider=_rec_provider,
+                model=_rec_model,
+                success=False,
+                latency_ms=_record_latency,
+                error_type=type(result["error"]).__name__,
+            )
+        else:
+            record_api_call(
+                provider=_rec_provider,
+                model=_rec_model,
+                success=True,
+                latency_ms=_record_latency,
+                error_type=None,
+            )
+    except Exception:
+        pass  # non-fatal
+
     if result["error"] is not None:
         raise result["error"]
     # Success — clear the circuit breaker (#58962): the provider proved
     # responsive.  See the canonical comment block above ``_stale_streak()``.
     if result["response"] is not None:
         _reset_stale_streak(agent)
+        # Also reset the global (provider, model) circuit breaker so a
+        # subsequent non-streaming success clears any stale failure count.
+        try:
+            _record_stream_success(agent, agent.provider, agent.model)
+        except Exception:
+            pass
     return result["response"]
 
 
@@ -1704,7 +1748,19 @@ def try_activate_fallback(agent, reason: "FailoverReason | None" = None) -> bool
     auth resolution and client construction — no duplicated provider→key
     mappings.
     """
-    if reason in {FailoverReason.rate_limit, FailoverReason.billing, FailoverReason.upstream_rate_limit}:
+    # Log a provider-health warning before switching to a fallback.
+    # Helps detect deteriorating reliability patterns in interactive
+    # and cron flows.  This fires on every fallback activation, so
+    # monitoring infra can track the warning frequency.
+    try:
+        _current_provider = str(getattr(agent, "provider", "") or "")
+        _current_model = str(getattr(agent, "model", "") or "")
+        if _current_provider and _current_model and _current_provider != "Mock" and not _current_provider.startswith("<MagicMock"):
+            from agent.provider_health_monitor import log_health_warning
+            log_health_warning(_current_provider, _current_model)
+    except Exception:
+        pass
+    if reason in {FailoverReason.rate_limit, FailoverReason.billing}:
         # Only start cooldown when leaving the primary provider.  If we're
         # already on a fallback and chain-switching, the primary wasn't the
         # source of the 429 so the cooldown should not be reset/extended.
@@ -1727,12 +1783,20 @@ def try_activate_fallback(agent, reason: "FailoverReason | None" = None) -> bool
                 backoff_count, backoff_seconds, backoff_seconds / 60, backoff_count + 1,
             )
     if agent._fallback_index >= len(agent._fallback_chain):
-        # Chain exhausted.  If we actually walked a non-empty chain and the
-        # failure was NOT a rate-limit/billing event (those already armed
-        # their own 60s cooldown above), arm a short cooldown so the next
-        # turn's restore_primary_runtime stays gated instead of resetting
-        # _fallback_index=0 and re-marshaling the whole context across every
-        # provider again.  Guards the cross-turn replay storm in #24996.
+        # Chain exhausted.  Mark the current provider dead so the retry
+        # loop doesn't keep trying it on subsequent turns without an
+        # intervening fallback re-initialisation.
+        _dead_reg = getattr(agent, "_dead_registry", None)
+        if _dead_reg is not None:
+            _dead_reg.mark_provider_dead(
+                (getattr(agent, "provider", "") or "").strip().lower(),
+                (getattr(agent, "model", "") or "").strip(),
+                reason="all fallbacks exhausted",
+            )
+        # Also arm a short cooldown so the next turn's restore_primary_runtime
+        # stays gated instead of resetting _fallback_index=0 and re-marshaling
+        # the whole context across every provider again.  Guards the cross-turn
+        # replay storm in #24996.
         if (
             len(agent._fallback_chain) > 0
             and reason not in {FailoverReason.rate_limit, FailoverReason.billing, FailoverReason.upstream_rate_limit}
@@ -1768,6 +1832,17 @@ def try_activate_fallback(agent, reason: "FailoverReason | None" = None) -> bool
             local_skip_reason,
         )
         return agent._try_activate_fallback(reason)
+
+    # Skip entries in the dead provider registry — a provider/model
+    # that was recently marked dead after exhausting all fallbacks
+    # should not be re-tried until the TTL expires.
+    _dead_reg = getattr(agent, "_dead_registry", None)
+    if _dead_reg is not None and _dead_reg.is_provider_dead(fb_provider, fb_model):
+        logger.info(
+            "Fallback skip: %s/%s is in dead provider registry",
+            fb_provider, fb_model,
+        )
+        return agent._try_activate_fallback()
 
     # Skip entries that resolve to the same backend that just failed —
     # falling back to it loops the failure. Identity semantics (which axes
@@ -2506,6 +2581,7 @@ def interruptible_streaming_api_call(agent, api_kwargs: dict, *, on_first_delta=
     Falls back to _interruptible_api_call on provider errors indicating
     streaming is not supported.
     """
+    _stream_call_start = time.time()
     if agent._interrupt_requested:
         raise InterruptedError("Agent interrupted before streaming API call")
 
@@ -3691,7 +3767,7 @@ def interruptible_streaming_api_call(agent, api_kwargs: dict, *, on_first_delta=
     def _call():
         import httpx as _httpx
 
-        _max_stream_retries = env_int("HERMES_STREAM_RETRIES", 2)
+        _max_stream_retries = env_int("HERMES_STREAM_RETRIES", 4)
 
         try:
             for _stream_attempt in range(_max_stream_retries + 1):
@@ -3719,6 +3795,9 @@ def interruptible_streaming_api_call(agent, api_kwargs: dict, *, on_first_delta=
                         result["response"] = _call_anthropic(request_client)
                     else:
                         result["response"] = _call_chat_completions(stream_attempt_id)
+                    # Circuit breaker: successful streaming call resets the
+                    # consecutive-failure counter for (provider, model).
+                    _record_stream_success(agent, agent.provider, agent.model)
                     return  # success
                 except Exception as e:
                     _close_managed_stream()
@@ -3804,6 +3883,8 @@ def interruptible_streaming_api_call(agent, api_kwargs: dict, *, on_first_delta=
                             logger.warning(
                                 "Streaming failed after partial delivery, not retrying: %s", e
                             )
+                            # Circuit breaker: count this as a streaming failure.
+                            _record_stream_failure(agent, agent.provider, agent.model, str(e))
                             result["error"] = e
                             return
                         # Tool call was in-flight AND error is transient:
@@ -3850,6 +3931,20 @@ def interruptible_streaming_api_call(agent, api_kwargs: dict, *, on_first_delta=
                         # #70773: same FD-recycle corruption vector for OpenAI.
                         # The shared client will be replaced lazily by
                         # _ensure_primary_openai_client on the next attempt.
+                        # Configurable backoff between stream retries
+                        # (same as the normal retry path below).
+                        _sr_base = env_float("HERMES_STREAM_RETRY_DELAY", 2.0)
+                        if _sr_base > 0:
+                            import random as _rand
+                            _sr_attempt_mid = _stream_attempt + 1
+                            _sr_cap_mid = env_float("HERMES_STREAM_RETRY_DELAY_CAP", 5.0)
+                            _sr_delay_mid = min(_sr_base * _sr_attempt_mid, _sr_cap_mid)
+                            _sr_delay_mid *= _rand.uniform(1.0, 1.25)
+                            logger.debug(
+                                "Mid-tool stream retry backoff: attempt %d sleeping %.1fs",
+                                _sr_attempt_mid, _sr_delay_mid,
+                            )
+                            time.sleep(_sr_delay_mid)
                         continue
 
                     # SSE error events from proxies (e.g. OpenRouter sends
@@ -3911,6 +4006,25 @@ def interruptible_streaming_api_call(agent, api_kwargs: dict, *, on_first_delta=
                             # #70773: same FD-recycle corruption vector for OpenAI.
                             # The shared client will be replaced lazily by
                             # _ensure_primary_openai_client on the next attempt.
+                            # Configurable backoff between stream retries.
+                            # Retries on the same provider are likely hitting
+                            # the same overloaded infrastructure; a short
+                            # jittered pause spreads the load and gives the
+                            # upstream a chance to recover.  Enabled by
+                            # default (2.0s base) — set HERMES_STREAM_RETRY_DELAY to
+                            # 0 to disable, or adjust for your needs.
+                            _sr_base = env_float("HERMES_STREAM_RETRY_DELAY", 2.0)
+                            if _sr_base > 0:
+                                import random as _rand
+                                _sr_attempt = _stream_attempt + 1
+                                _sr_cap = env_float("HERMES_STREAM_RETRY_DELAY_CAP", 5.0)
+                                _sr_delay = min(_sr_base * _sr_attempt, _sr_cap)
+                                _sr_delay *= _rand.uniform(1.0, 1.25)  # 25% jitter
+                                logger.debug(
+                                    "Stream retry backoff: attempt %d sleeping %.1fs",
+                                    _sr_attempt, _sr_delay,
+                                )
+                                time.sleep(_sr_delay)
                             continue
                         # Retries exhausted. Log the final failure with
                         # full diagnostic detail (chain, headers,
@@ -4001,6 +4115,9 @@ def interruptible_streaming_api_call(agent, api_kwargs: dict, *, on_first_delta=
                     # richer recovery: credential rotation, provider fallback,
                     # backoff, and — for "stream not supported" — will switch
                     # to non-streaming on the next attempt via _disable_streaming.
+                    # Circuit breaker: count as a streaming failure so repeated
+                    # connection drops trip the breaker and activate fallback.
+                    _record_stream_failure(agent, agent.provider, agent.model, str(e))
                     result["error"] = e
                     return
         except InterruptedError as e:
@@ -4180,6 +4297,18 @@ def interruptible_streaming_api_call(agent, api_kwargs: dict, *, on_first_delta=
             agent._touch_activity(
                 f"stale stream detected after {int(_stale_elapsed)}s, reconnecting"
             )
+            # Record stream stale as a provider metric
+            try:
+                from agent.provider_health_monitor import record_api_call
+                record_api_call(
+                    provider=str(getattr(agent, "provider", "") or ""),
+                    model=str(getattr(agent, "model", "") or ""),
+                    success=False,
+                    latency_ms=_stale_elapsed * 1000,
+                    error_type="stream_stale",
+                )
+            except Exception:
+                pass
 
         if agent._interrupt_requested:
             # Mark THIS request cancelled before force-closing so the worker's
@@ -4301,12 +4430,51 @@ def interruptible_streaming_api_call(agent, api_kwargs: dict, *, on_first_delta=
             )
             if _content_filter_terminated:
                 _stub._content_filter_terminated = True
+            # Record partial-stream result: the stream delivered some content
+            # but failed before finishing. Treat as a soft failure.
+            try:
+                from agent.provider_health_monitor import record_api_call
+                record_api_call(
+                    provider=str(getattr(agent, "provider", "") or ""),
+                    model=str(getattr(agent, "model", "") or ""),
+                    success=False,
+                    latency_ms=(time.time() - _stream_call_start) * 1000,
+                    error_type="partial_stream",
+                )
+            except Exception:
+                pass
             # Partial-stream stub: chunks WERE received (deltas fired), so
             # the provider is demonstrably responsive — clear the circuit
             # breaker (#58962) just like the full-success return below.
             _reset_stale_streak(agent)
             return _stub
+        # Full error — record as failed call
+        _record_latency = (time.time() - _stream_call_start) * 1000
+        try:
+            from agent.provider_health_monitor import record_api_call
+            record_api_call(
+                provider=str(getattr(agent, "provider", "") or ""),
+                model=str(getattr(agent, "model", "") or ""),
+                success=False,
+                latency_ms=_record_latency,
+                error_type=type(result["error"]).__name__,
+            )
+        except Exception:
+            pass
         raise result["error"]
+    # Success — record as successful call
+    _record_latency = (time.time() - _stream_call_start) * 1000
+    try:
+        from agent.provider_health_monitor import record_api_call
+        record_api_call(
+            provider=str(getattr(agent, "provider", "") or ""),
+            model=str(getattr(agent, "model", "") or ""),
+            success=True,
+            latency_ms=_record_latency,
+            error_type=None,
+        )
+    except Exception:
+        pass
     # Success — clear the circuit breaker (#58962): the provider proved
     # responsive.  See the canonical comment block above ``_stale_streak()``.
     if result["response"] is not None:

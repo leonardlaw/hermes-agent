@@ -3465,6 +3465,20 @@ def run_conversation(
                     outcome="success",
                 )
                 agent._touch_activity(f"API call #{api_call_count} completed")
+
+                # Record call metrics on success.
+                _dpr = getattr(agent, "_dead_registry", None)
+                if _dpr is not None:
+                    try:
+                        _dpr.record_call(
+                            provider=agent.provider or "",
+                            model=agent.model or "",
+                            success=True,
+                            latency_ms=(time.time() - api_start_time) * 1000,
+                        )
+                    except Exception:
+                        pass
+
                 break  # Success, exit retry loop
 
             except InterruptedError:
@@ -4456,6 +4470,38 @@ def run_conversation(
                             _retry.primary_recovery_attempted = False
                             continue
 
+                # ── Transport-error eager fallback ────────────────────────
+                # Broken pipe, connection reset, and similar transport errors
+                # are unlikely to recover by retrying the same provider's stale
+                # connections.  After 1 retry (to rule out a true transient
+                # hiccup), switch to the fallback provider immediately instead
+                # of burning the full retry budget.  Matches the 30-second
+                # recovery requirement for simulated OpenCode failures (#a8fa1329).
+                # Transport errors are classified as timeout+retryable=True with
+                # should_fallback=False, so they miss both the eager rate-limit
+                # path and the client-error path above.
+                _is_transport_error = (
+                    classified.reason == FailoverReason.timeout
+                    and isinstance(api_error, (ConnectionError, OSError, TimeoutError))
+                )
+                if (
+                    _is_transport_error
+                    and retry_count >= 1  # already retried once on primary
+                    and not _retry.transport_failover_attempted
+                    and agent._fallback_index < len(agent._fallback_chain)
+                ):
+                    _retry.transport_failover_attempted = True
+                    agent._buffer_status(
+                        "⚠️ Transport connection error — falling back to alternate provider..."
+                    )
+                    if agent._try_activate_fallback(reason=classified.reason):
+                        active_system_prompt = _sync_failover_system_message(
+                            agent, api_messages, active_system_prompt)
+                        retry_count = 0
+                        compression_attempts = 0
+                        _retry.primary_recovery_attempted = False
+                        continue
+
                 # ── Auth-failure provider failover ───────────────────────
                 # A 401/403 that survives the per-provider credential-refresh
                 # attempt above (each guarded by its own
@@ -5195,6 +5241,21 @@ def run_conversation(
                             force=True,
                         )
                     logger.error("%sNon-retryable client error: %s", agent.log_prefix, api_error)
+
+                    # Record call metrics on non-retryable error.
+                    _dpr_nr = getattr(agent, "_dead_registry", None)
+                    if _dpr_nr is not None:
+                        try:
+                            _dpr_nr.record_call(
+                                provider=agent.provider or "",
+                                model=agent.model or "",
+                                success=False,
+                                latency_ms=(time.time() - api_start_time) * 1000,
+                                error_type=classified.reason.value if classified and classified.reason else "non_retryable",
+                            )
+                        except Exception:
+                            pass
+
                     # Skip session persistence when the error is likely
                     # context-overflow related (status 400 + large session).
                     # Persisting the failed user message would make the
@@ -5401,6 +5462,21 @@ def run_conversation(
                         agent.log_prefix, max_retries, _final_summary,
                         _provider, _model, len(api_messages), f"{approx_tokens:,}",
                     )
+
+                    # Record call metrics on terminal failure.
+                    _dpr_fail = getattr(agent, "_dead_registry", None)
+                    if _dpr_fail is not None:
+                        try:
+                            _dpr_fail.record_call(
+                                provider=agent.provider or "",
+                                model=agent.model or "",
+                                success=False,
+                                latency_ms=(time.time() - api_start_time) * 1000,
+                                error_type=classified.reason.value if classified.reason else "unknown",
+                            )
+                        except Exception:
+                            pass
+
                     if api_kwargs is not None:
                         agent._dump_api_request_debug(
                             api_kwargs, reason="max_retries_exhausted", error=api_error,
@@ -5474,7 +5550,30 @@ def run_conversation(
                                 _retry_after = min(float(_ra_raw), 600)
                             except (TypeError, ValueError):
                                 pass
-                wait_time = _retry_after if _retry_after else jittered_backoff(retry_count, base_delay=2.0, max_delay=60.0)
+                # Stream-stale detection for shorter backoff: broken pipe,
+                # RemoteProtocolError, or stale-stream messages from the
+                # inner retry loop are prefill-transient failures on the
+                # upstream provider (not server overload).  Use a tighter
+                # max_delay cap so the outer retry completes faster and
+                # falls through to the fallback chain sooner.
+                _is_stream_stale = (
+                    error_type in ("BrokenPipeError", "RemoteProtocolError")
+                    or "broken pipe" in error_msg
+                    or "stale stream" in error_msg
+                )
+                _stream_stale_backoff = (
+                    _is_stream_stale
+                    and api_error is not None
+                    and classified.reason == FailoverReason.timeout
+                )
+                if _stream_stale_backoff:
+                    wait_time = _retry_after if _retry_after else jittered_backoff(
+                        retry_count, base_delay=2.0, max_delay=30.0,
+                    )
+                else:
+                    wait_time = _retry_after if _retry_after else jittered_backoff(
+                        retry_count, base_delay=2.0, max_delay=60.0,
+                    )
                 _backoff_policy = None
                 if (is_rate_limited or _is_zai_coding_overload) and not _retry_after:
                     wait_time, _backoff_policy = adaptive_rate_limit_backoff(

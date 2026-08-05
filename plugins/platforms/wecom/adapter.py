@@ -312,12 +312,21 @@ class WeComAdapter(BasePlatformAdapter):
     async def _open_connection(self) -> None:
         """Open and authenticate a websocket connection."""
         await self._cleanup_ws()
-        self._session = aiohttp.ClientSession(trust_env=True)
-        self._ws = await self._session.ws_connect(
-            self._ws_url,
-            heartbeat=HEARTBEAT_INTERVAL_SECONDS * 2,
-            timeout=CONNECT_TIMEOUT_SECONDS,
-        )
+        session = None
+        try:
+            import aiohttp
+            session = aiohttp.ClientSession(trust_env=True)
+            ws = await session.ws_connect(
+                self._ws_url,
+                heartbeat=HEARTBEAT_INTERVAL_SECONDS * 2,
+                timeout=CONNECT_TIMEOUT_SECONDS,
+            )
+        except Exception:
+            if session is not None:
+                await session.close()
+            raise
+        self._session = session
+        self._ws = ws
 
         req_id = self._new_req_id("subscribe")
         await self._send_json(

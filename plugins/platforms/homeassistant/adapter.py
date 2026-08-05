@@ -140,9 +140,11 @@ class HomeAssistantAdapter(BasePlatformAdapter):
                 return False
 
             # Dedicated REST session for send() calls
-            self._rest_session = aiohttp.ClientSession(
+            import aiohttp
+            session = aiohttp.ClientSession(
                 timeout=aiohttp.ClientTimeout(total=30)
             )
+            self._rest_session = session
 
             # Warn if no event filters are configured
             if not self._watch_domains and not self._watch_entities and not self._watch_all:
@@ -168,10 +170,20 @@ class HomeAssistantAdapter(BasePlatformAdapter):
         ws_url = self._hass_url.replace("https://", "wss://").replace("http://", "ws://")
         ws_url = f"{ws_url}/api/websocket"
 
-        self._session = aiohttp.ClientSession(
-            timeout=aiohttp.ClientTimeout(total=30)
-        )
-        self._ws = await self._session.ws_connect(ws_url, heartbeat=30, timeout=30)
+        session = None
+        try:
+            import aiohttp
+            session = aiohttp.ClientSession(
+                timeout=aiohttp.ClientTimeout(total=30)
+            )
+            ws = await session.ws_connect(ws_url, heartbeat=30, timeout=30)
+        except Exception:
+            if session is not None:
+                await session.close()
+            raise
+        
+        self._session = session
+        self._ws = ws
 
         # Step 1: Receive auth_required
         msg = await self._ws.receive_json()
