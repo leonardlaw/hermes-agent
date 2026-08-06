@@ -1348,7 +1348,9 @@ def _send_media_via_adapter(
     """
     from pathlib import Path
 
-    from gateway.platforms.base import should_send_media_as_audio
+    from gateway.platforms.base import BasePlatformAdapter, should_send_media_as_audio
+
+    media_files = BasePlatformAdapter.filter_media_delivery_paths(media_files)
 
     for media_path, _is_voice in media_files:
         try:
@@ -1525,6 +1527,7 @@ def _deliver_result(job: dict, content: str, adapters=None, loop=None) -> Option
     # Extract MEDIA: tags so attachments are forwarded as files, not raw text
     from gateway.platforms.base import BasePlatformAdapter
     media_files, cleaned_delivery_content = BasePlatformAdapter.extract_media(delivery_content)
+    media_files = BasePlatformAdapter.filter_media_delivery_paths(media_files)
 
     # Resolve the delivery-mirror gate ONCE (default off). When on, each
     # successful delivery is also appended to the target chat's gateway session
