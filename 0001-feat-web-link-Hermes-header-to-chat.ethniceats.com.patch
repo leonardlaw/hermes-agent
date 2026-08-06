@@ -1,0 +1,55 @@
+From 7c45a81be29f94a38613a96371417b6af5c52f86 Mon Sep 17 00:00:00 2001
+From: Leonard Law <leonardlaw@Leonards-Mac-Studio-5.local>
+Date: Tue, 26 May 2026 22:20:29 -0700
+Subject: [PATCH] feat(web): link Hermes header to chat.ethniceats.com
+
+Wrap both mobile and desktop brand text in anchor tags pointing to
+https://chat.ethniceats.com so users can return to the main chat
+interface. Preserves existing styling (mixBlendMode, uppercase, font
+weights, colors) and adds no-underline to avoid link styling regression.
+Removes now-unused Typography import.
+---
+ web/src/App.tsx | 16 ++++++++++++----
+ 1 file changed, 12 insertions(+), 4 deletions(-)
+
+diff --git a/web/src/App.tsx b/web/src/App.tsx
+index 79f7e4853..158888ded 100644
+--- a/web/src/App.tsx
++++ b/web/src/App.tsx
+@@ -519,9 +519,13 @@ export default function App() {
+           <Menu />
+         </Button>
+ 
+-        <Typography className="font-bold text-[0.95rem] leading-[0.95] tracking-[0.05em] text-midground">
++        <a
++          href="https://chat.ethniceats.com"
++          className="font-bold text-[0.95rem] leading-[0.95] tracking-[0.05em] text-midground no-underline"
++          style={{ mixBlendMode: "plus-lighter" }}
++        >
+           {t.app.brand}
+-        </Typography>
++        </a>
+       </header>
+ 
+       {mobileOpen && (
+@@ -575,11 +579,15 @@ export default function App() {
+               >
+                 <PluginSlot name="header-left" />
+ 
+-                <Typography className="font-bold text-[1.125rem] leading-[0.95] tracking-[0.0525rem] text-midground uppercase">
++                <a
++                  href="https://chat.ethniceats.com"
++                  className="font-bold text-[1.125rem] leading-[0.95] tracking-[0.0525rem] text-midground uppercase no-underline"
++                  style={{ mixBlendMode: "plus-lighter" }}
++                >
+                   Hermes
+                   <br />
+                   Agent
+-                </Typography>
++                </a>
+               </div>
+ 
+               <Button
+-- 
+2.50.1 (Apple Git-155)
+

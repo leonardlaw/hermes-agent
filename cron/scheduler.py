@@ -1348,9 +1348,7 @@ def _send_media_via_adapter(
     """
     from pathlib import Path
 
-    from gateway.platforms.base import BasePlatformAdapter, should_send_media_as_audio
-
-    media_files = BasePlatformAdapter.filter_media_delivery_paths(media_files)
+    from gateway.platforms.base import should_send_media_as_audio
 
     for media_path, _is_voice in media_files:
         try:
@@ -1527,7 +1525,6 @@ def _deliver_result(job: dict, content: str, adapters=None, loop=None) -> Option
     # Extract MEDIA: tags so attachments are forwarded as files, not raw text
     from gateway.platforms.base import BasePlatformAdapter
     media_files, cleaned_delivery_content = BasePlatformAdapter.extract_media(delivery_content)
-    media_files = BasePlatformAdapter.filter_media_delivery_paths(media_files)
 
     # Resolve the delivery-mirror gate ONCE (default off). When on, each
     # successful delivery is also appended to the target chat's gateway session
@@ -3709,7 +3706,15 @@ def run_job(
             and turn_exit_reason.startswith("max_iterations_reached(")
             and bool(final_response_text)
         )
-        if result.get("failed") is True or (result.get("completed") is False and not max_iteration_summary):
+        # If the agent produced substantive output without explicitly failing,
+        # treat it as success regardless of the specific turn_exit_reason.
+        # The max_iteration_summary bypass above is too narrow — the same
+        # pattern (completed=False + valid output) can occur with other
+        # non-standard exit reasons, e.g. when a follow-up API handshake
+        # fails after the agent already generated the content.
+        if result.get("failed") is not True and bool(final_response_text):
+            pass  # Valid output exists — let through as success
+        elif result.get("failed") is True or (result.get("completed") is False and not max_iteration_summary):
             _err_text = (
                 result.get("error")
                 or final_response_text

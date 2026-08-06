@@ -59,7 +59,6 @@ import {
 import { Button } from "@nous-research/ui/ui/components/button";
 import { SelectionSwitcher } from "@nous-research/ui/ui/components/selection-switcher";
 import { Spinner } from "@nous-research/ui/ui/components/spinner";
-import { Typography } from "@nous-research/ui/ui/components/typography/index";
 import { ConfirmDialog } from "@nous-research/ui/ui/components/confirm-dialog";
 import { cn } from "@/lib/utils";
 import { SidebarFooter } from "@/components/SidebarFooter";
@@ -548,9 +547,13 @@ export default function App() {
           <Menu />
         </Button>
 
-        <Typography className="font-bold text-[0.95rem] leading-[0.95] tracking-[0.05em] text-midground">
+        <a
+          href="https://chat.ethniceats.com"
+          className="font-bold text-[0.95rem] leading-[0.95] tracking-[0.05em] text-midground no-underline"
+          style={{ mixBlendMode: "plus-lighter" }}
+        >
           {t.app.brand}
-        </Typography>
+        </a>
       </header>
 
       {mobileOpen && (
@@ -604,11 +607,15 @@ export default function App() {
               >
                 <PluginSlot name="header-left" />
 
-                <Typography className="font-bold text-[1.125rem] leading-[0.95] tracking-[0.0525rem] text-midground uppercase">
+                <a
+                  href="https://chat.ethniceats.com"
+                  className="font-bold text-[1.125rem] leading-[0.95] tracking-[0.0525rem] text-midground uppercase no-underline"
+                  style={{ mixBlendMode: "plus-lighter" }}
+                >
                   Hermes
                   <br />
                   Agent
-                </Typography>
+                </a>
               </div>
 
               <Button

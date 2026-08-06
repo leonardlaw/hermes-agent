@@ -819,6 +819,29 @@ class PluginContext:
             self.manifest.name, provider.name,
         )
 
+    def register_model_router_provider(self, provider) -> None:
+        """Register a model router for inbound message classification.
+
+        ``provider`` must be an instance of
+        :class:`agent.model_router_provider.ModelRouterProvider`.
+        The ``provider.name`` attribute is the display key.
+        """
+        from agent.model_router_provider import ModelRouterProvider
+        from agent.model_router_registry import register_provider as _register_model_router_provider
+
+        if not isinstance(provider, ModelRouterProvider):
+            logger.warning(
+                "Plugin '%s' tried to register a model router that does "
+                "not inherit from ModelRouterProvider. Ignoring.",
+                self.manifest.name,
+            )
+            return
+        _register_model_router_provider(provider)
+        logger.info(
+            "Plugin '%s' registered model router provider: %s",
+            self.manifest.name, provider.name,
+        )
+
     # -- secret source registration -------------------------------------------
 
     def register_secret_source(self, source) -> None:
@@ -1281,6 +1304,10 @@ class PluginManager:
         self._plugin_commands: Dict[str, dict] = {}  # Slash commands registered by plugins
         self._discovered: bool = False
         self._cli_ref = None  # Set by CLI after plugin discovery
+        # Tracks plugin names whose load failure has already been logged
+        # this process lifetime. Used to suppress repeat warnings so a
+        # missing plugin module doesn't flood the log on every restart.
+        self._logged_plugin_failures: Set[str] = set()
         # Plugin skill registry: qualified name → metadata dict.
         self._plugin_skills: Dict[str, Dict[str, Any]] = {}
         # Plugin-registered auxiliary tasks: key → {key, display_name,
@@ -1845,10 +1872,18 @@ class PluginManager:
 
         except Exception as exc:
             loaded.error = str(exc)
-            logger.warning(
-                "Failed to load plugin '%s': %s",
-                manifest.name, exc, exc_info=_PLUGINS_DEBUG,
-            )
+            plugin_name = manifest.name or manifest.key or ""
+            if plugin_name not in self._logged_plugin_failures:
+                self._logged_plugin_failures.add(plugin_name)
+                logger.warning(
+                    "Failed to load plugin '%s': %s",
+                    plugin_name, exc, exc_info=_PLUGINS_DEBUG,
+                )
+            else:
+                logger.debug(
+                    "Failed to load plugin '%s' (suppressed, first failure already logged): %s",
+                    plugin_name, exc,
+                )
         self._plugins[manifest.key or manifest.name] = loaded
 
     def _load_directory_module(self, manifest: PluginManifest) -> types.ModuleType:

@@ -10719,6 +10719,14 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             self._start_loop_liveness_guards(self._gateway_loop)
         logger.info("Session storage: %s", self.config.sessions_dir)
 
+        # Discover and load plugins (user plugins at ~/.hermes/plugins/)
+        try:
+            from hermes_cli.plugins import discover_plugins
+            discover_plugins()
+            logger.info("Plugin discovery completed")
+        except Exception as _plug_exc:
+            logger.debug("Plugin discovery skipped: %s", _plug_exc)
+        
         # Sanity-check that systemd's TimeoutStopSec covers our drain
         # window.  When the user upgraded hermes-agent without re-running
         # ``hermes setup``, their unit file may still encode the old
@@ -11131,17 +11139,33 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     )
                     logger.info("✓ %s connected", platform.value)
                 else:
-                    logger.warning("✗ %s failed to connect", platform.value)
-                    # Defensive cleanup: a failed connect() may have
-                    # allocated resources (aiohttp.ClientSession, poll
-                    # tasks, bridge subprocesses) before giving up.
-                    # Without this call, those resources are orphaned
-                    # and Python logs "Unclosed client session" at
-                    # process exit. Adapter disconnect() implementations
-                    # are expected to be idempotent and tolerate
-                    # partial-init state.
-                    await self._safe_adapter_disconnect(adapter, platform)
-                    if adapter.has_fatal_error:
+                    lock_contention = getattr(adapter, '_platform_lock_contention', False)
+                    if lock_contention:
+                        # Another live gateway instance holds the bot-token poll
+                        # lock.  This is expected when multiple profiles share the
+                        # same credential.  Gracefully degrade: log at INFO, show
+                        # "standby" status, and periodically re-check so takeover
+                        # works if the primary gateway stops.
+                        logger.info(
+                            "⊘ %s in standby mode — poll lock held by another "
+                            "gateway instance (will re-check every 5 min)",
+                            platform.value,
+                        )
+                        self._update_platform_runtime_status(
+                            platform.value,
+                            platform_state="standby",
+                            error_code=None,
+                            error_message="poll lock held by another gateway (standby)",
+                        )
+                        # Slow re-check: 300s (no aggressive backoff needed since
+                        # this is expected multi-profile contention, not a failure).
+                        self._failed_platforms[platform] = {
+                            "config": platform_config,
+                            "attempts": 1,
+                            "next_retry": time.monotonic() + 300,
+                            "_lock_contention": True,
+                        }
+                    elif adapter.has_fatal_error:
                         self._update_platform_runtime_status(
                             platform.value,
                             platform_state="retrying" if adapter.fatal_error_retryable else "fatal",
@@ -11170,6 +11194,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                                 ),
                             }
                     else:
+                        logger.warning("✗ %s failed to connect", platform.value)
                         self._update_platform_runtime_status(
                             platform.value,
                             platform_state="retrying",
@@ -11191,6 +11216,20 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                                 platform, adapter
                             ),
                         }
+                    # Defensive cleanup: a failed connect() may have
+                    # allocated resources (aiohttp.ClientSession, poll
+                    # tasks, bridge subprocesses) before giving up.
+                    # Without this call, those resources are orphaned
+                    # and Python logs "Unclosed client session" at
+                    # process exit. Adapter disconnect() implementations
+                    # are expected to be idempotent and tolerate
+                    # partial-init state.
+                    # NOTE: safe_adapter_disconnect is called AFTER the
+                    # lock_contention check above because _platform_lock_contention
+                    # is an attribute on the adapter; the disconnection may clear
+                    # it.  Capture the flag value before cleanup.
+                    if lock_contention:
+                        await self._safe_adapter_disconnect(adapter, platform)
             except Exception as e:
                 logger.error("✗ %s error: %s", platform.value, e)
                 # Same defensive cleanup path for exceptions — an adapter
@@ -16393,13 +16432,17 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             # path (#9893). Covers daily/idle/suspended auto-reset.
             self._evict_cached_agent(session_key)
             session_entry.was_auto_reset = False
-        
-        # Emit session:start for new or auto-reset sessions
+
+        # Determine if this is a new session (for model routing + session:start)
         _is_new_session = (
             session_entry.created_at == session_entry.updated_at
             or _was_auto_reset
             or getattr(session_entry, "is_fresh_reset", False)
         )
+        
+        # Emit session:start for new or auto-reset sessions
+        # NOTE: includes event.text so model-router plugins can classify the
+        # inbound message and set _session_model_overrides before agent build.
         # Consume the is_fresh_reset flag immediately so it doesn't leak
         # onto subsequent messages in the same session (issue #6508).
         if getattr(session_entry, "is_fresh_reset", False):
@@ -16410,6 +16453,8 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 "user_id": source.user_id,
                 "session_id": session_entry.session_id,
                 "session_key": session_key,
+                "text": event.text or "",
+                "has_image": bool(getattr(event, "image", None)),
             })
         
         # Build session context

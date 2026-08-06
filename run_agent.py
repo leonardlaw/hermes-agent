@@ -120,6 +120,7 @@ from agent.interrupt_compat import request_hard_interrupt
 
 from hermes_cli.env_loader import load_hermes_dotenv
 from hermes_cli.timeouts import (
+    get_min_provider_stale_timeout_by_url,
     get_provider_request_timeout,
     get_provider_stale_timeout,
 )
@@ -1432,6 +1433,13 @@ class AIAgent:
         Responses API) or a legacy ``messages`` list.  Context-size scaling
         applies the same way to both shapes via
         :func:`agent.chat_completion_helpers.estimate_request_context_tokens`.
+
+        The result is capped at the configured ``timeout_seconds`` /
+        ``request_timeout_seconds`` (if set) so the stale detector never
+        waits longer than the HTTP request timeout.  Without this cap the
+        context-size scaling for large payloads (>100k tokens) raises the
+        stale timeout to 240s while the HTTP timeout remains 60s, allowing
+        repeated HTTP-timeout retries before the stale detector acts.
         """
         stale_base, uses_implicit_default = self._resolved_api_call_stale_timeout_base()
         base_url = getattr(self, "_base_url", None) or self.base_url or ""
@@ -1441,10 +1449,23 @@ class AIAgent:
         from agent.chat_completion_helpers import estimate_request_context_tokens
         est_tokens = estimate_request_context_tokens(api_payload)
         if est_tokens > 100_000:
-            return max(stale_base, 240.0)
-        if est_tokens > 50_000:
-            return max(stale_base, 150.0)
-        return stale_base
+            result = max(stale_base, 240.0)
+        elif est_tokens > 50_000:
+            result = max(stale_base, 150.0)
+        else:
+            result = stale_base
+
+        # Cap at the configured request timeout so the stale detector never
+        # out-lasts the HTTP-level timeout.  This ensures that for providers
+        # with a short timeout_seconds (e.g. 60s for deepseek-v4-flash) the
+        # stale detector fires before the HTTP read timeout expires, giving
+        # the retry loop a clean kill + diagnostics instead of a raw
+        # httpx.ReadTimeout that retries silently.
+        request_cap = self._resolved_api_call_timeout()
+        if request_cap < result:
+            result = request_cap
+
+        return result
 
     def _codex_silent_hang_hint(self, model: Optional[str] = None) -> Optional[str]:
         """Return an actionable hint when this request matches a known
@@ -4747,8 +4768,87 @@ class AIAgent:
         try:
             import httpx as _httpx
 
-            # Explicitly read proxy settings so requests route through
-            # HTTP_PROXY / HTTPS_PROXY / NO_PROXY correctly.
+            if "api.githubcopilot.com" in str(base_url or "").lower():
+                return _httpx.Client(verify=verify)
+
+            _sock_opts = [(_socket.SOL_SOCKET, _socket.SO_KEEPALIVE, 1)]
+            if hasattr(_socket, "TCP_KEEPIDLE"):
+                _sock_opts.append((_socket.IPPROTO_TCP, _socket.TCP_KEEPIDLE, 30))
+                _sock_opts.append((_socket.IPPROTO_TCP, _socket.TCP_KEEPINTVL, 10))
+                _sock_opts.append((_socket.IPPROTO_TCP, _socket.TCP_KEEPCNT, 3))
+            elif hasattr(_socket, "TCP_KEEPALIVE"):
+                _sock_opts.append((_socket.IPPROTO_TCP, _socket.TCP_KEEPALIVE, 30))
+
+            # ── Disable connection keepalive for aggressively-closing gateways ──
+            # Some provider gateways (opencode.ai, DeepSeek upstream) close idle
+            # connections at the load balancer within <5s of inactivity.  The
+            # client-side keepalive pool can't reliably race this, so pooled
+            # connections are often dead when retrieved — producing [Errno 32]
+            # Broken pipe on the next write (#a8fa1329, root cause of 51+ daily
+            # failures in pipeline cron jobs).
+            #
+            # Decision hierarchy (first match wins):
+            # 1. Config-driven: if the URL matches a provider in config and that
+            #    provider's minimum stale_timeout_seconds across all models
+            #    is <= 180 (3 min), disable keepalive — providers with short
+            #    stale timeouts are likely behind load balancers that close idle
+            #    connections aggressively.
+            # 2. Hostname-based safety net: hardcoded known-gateway hostnames.
+            # max_keepalive=0 forces a fresh TCP connection on every request,
+            # eliminating the stale-connection-reuse race entirely.  The marginal
+            # TCP handshake cost (~1 round-trip ~20ms) is negligible against
+            # 300-600s streaming requests.
+            _gateway_base_url = str(base_url or "").lower()
+            _disable_keepalive = False
+
+            # ── Decision path 1: config-driven stale timeout detection ──
+            # If get_min_provider_stale_timeout_by_url returns a value and it's
+            # <= 180s, the provider aggressively closes idle connections.
+            _decision_source = "default"
+            _config_timeout = get_min_provider_stale_timeout_by_url(
+                _gateway_base_url
+            )
+            if _config_timeout is not None:
+                _disable_keepalive = _config_timeout <= 180.0
+                _decision_source = (
+                    "config (stale_timeout={:.0f}s <= 180s)".format(_config_timeout)
+                    if _disable_keepalive
+                    else "config (stale_timeout={:.0f}s > 180s)".format(_config_timeout)
+                )
+
+            # ── Decision path 2: hostname safety net ──
+            if not _disable_keepalive:
+                _no_keepalive_gateways = (
+                    "opencode.ai",
+                )
+                if any(_host in _gateway_base_url for _host in _no_keepalive_gateways):
+                    _disable_keepalive = True
+                    _decision_source = "hostname"
+
+            logger.debug(
+                "Keepalive decision for %s: disabled=%s (source=%s)",
+                _gateway_base_url, _disable_keepalive, _decision_source,
+            )
+
+            if _disable_keepalive:
+                _pool_limits = _httpx.Limits(
+                    max_connections=20,
+                    max_keepalive_connections=0,
+                    keepalive_expiry=0.0,
+                )
+            else:
+                # Explicit pool limits to prevent stale connection reuse.
+                # Default httpx keepalive expiry (5s) is short, but reducing
+                # it further helps bursty reconnection patterns.
+                _pool_limits = _httpx.Limits(
+                    max_connections=20,
+                    max_keepalive_connections=10,
+                    keepalive_expiry=1.0,
+                )
+            # When a custom transport is provided, httpx won't auto-read proxy
+            # from env vars (allow_env_proxies = trust_env and transport is None).
+            # Explicitly read proxy settings while still honoring NO_PROXY for
+            # loopback / local endpoints such as a locally hosted sub2api.
             _proxy = _get_proxy_for_base_url(base_url)
 
             # Proactive pool reaping: close idle connections at 20 s,
@@ -4779,7 +4879,11 @@ class AIAgent:
                     "https://": _httpx.HTTPTransport(verify=verify),
                 }
             return _httpx.Client(
-                limits=_limits,
+                transport=_httpx.HTTPTransport(
+                    socket_options=_sock_opts,
+                    limits=_pool_limits,
+                    verify=verify,
+                ),
                 timeout=_timeout,
                 proxy=_proxy,
                 mounts=_mounts or None,

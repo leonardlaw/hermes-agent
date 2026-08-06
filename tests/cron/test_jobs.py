@@ -412,6 +412,42 @@ class TestMarkJobRun:
         assert updated["last_error"]
         assert "croniter" in updated["last_error"].lower()
 
+    def test_retry_on_transient_save_failure(self, tmp_cron_dir, monkeypatch):
+        """save_jobs failures should be retried with exponential backoff."""
+        job = create_job(prompt="Retry me", schedule="every 1h")
+        call_count = 0
+        original_save = save_jobs
+
+        def flaky_save(jobs_list):
+            nonlocal call_count
+            call_count += 1
+            if call_count < 3:
+                raise OSError("disk full")
+            original_save(jobs_list)
+
+        monkeypatch.setattr("cron.jobs.save_jobs", flaky_save)
+        mark_job_run(job["id"], success=True)
+        assert call_count == 3
+        updated = get_job(job["id"])
+        assert updated["last_status"] == "ok"
+
+    def test_terminal_failure_logs_error(self, tmp_cron_dir, caplog, monkeypatch):
+        """When all retries are exhausted, an ERROR log with job_id and timestamp is emitted."""
+        job = create_job(prompt="Doomed", schedule="every 1h")
+        monkeypatch.setattr("cron.jobs.save_jobs", lambda _jobs: (_ for _ in ()).throw(OSError("read-only filesystem")))
+
+        with pytest.raises(OSError):
+            mark_job_run(job["id"], success=True)
+
+        error_records = [r for r in caplog.records if r.levelname == "ERROR"]
+        assert error_records, "Expected at least one ERROR log record"
+        msg = error_records[-1].getMessage()
+        assert job["id"] in msg, f"ERROR log should contain job_id: {msg}"
+        # Timestamp is included in the message (ISO format from _hermes_now)
+        import re
+        assert re.search(r"\d{4}-\d{2}-\d{2}T", msg), f"ERROR log should contain ISO timestamp: {msg}"
+        assert "read-only filesystem" in msg, f"ERROR log should contain exception details: {msg}"
+
 
 class TestAdvanceNextRun:
     """Tests for advance_next_run() — crash-safety for recurring jobs."""

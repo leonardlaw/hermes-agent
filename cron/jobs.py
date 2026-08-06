@@ -12,6 +12,7 @@ from dataclasses import dataclass
 import json
 import logging
 import shutil
+import time
 import tempfile
 import threading
 import time
@@ -1102,6 +1103,38 @@ def save_jobs(jobs: List[Dict[str, Any]]):
         _save_jobs_unlocked(jobs)
 
 
+def _save_jobs_with_retry(jobs: List[Dict[str, Any]], job_id: str,
+                          max_retries: int = 3, base_delay: float = 0.05):
+    """Persist jobs with exponential backoff on transient IO failures.
+
+    On terminal failure logs an ERROR containing the job_id and timestamp.
+    """
+    last_exception: Exception = RuntimeError("save_jobs_with_retry invoked without attempting save")
+    for attempt in range(max_retries + 1):
+        try:
+            save_jobs(jobs)
+            return
+        except (OSError, IOError) as exc:
+            last_exception = exc
+            if attempt < max_retries:
+                delay = base_delay * (2 ** attempt)
+                logger.warning(
+                    "save_jobs failed for job '%s' (attempt %d/%d): %s — "
+                    "retrying in %.3fs",
+                    job_id, attempt + 1, max_retries + 1, exc, delay,
+                )
+                time.sleep(delay)
+            else:
+                break
+    # Terminal failure — all retries exhausted
+    now = _hermes_now().isoformat()
+    logger.error(
+        "Terminal failure persisting job state for '%s' at %s: %s",
+        job_id, now, last_exception,
+    )
+    raise last_exception
+
+
 def _normalize_workdir(workdir: Optional[str]) -> Optional[str]:
     """Normalize and validate a cron job workdir.
 
@@ -1751,7 +1784,7 @@ def mark_job_run(job_id: str, success: bool, error: Optional[str] = None,
                         job["enabled"] = False
                         job["state"] = "completed"
                         job["next_run_at"] = None
-                        save_jobs(jobs)
+                        _save_jobs_with_retry(jobs, job_id)
                         return
                 
                 # Compute next run
@@ -1786,7 +1819,7 @@ def mark_job_run(job_id: str, success: bool, error: Optional[str] = None,
                 elif job.get("state") != "paused":
                     job["state"] = "scheduled"
 
-                save_jobs(jobs)
+                _save_jobs_with_retry(jobs, job_id)
                 return
 
         logger.warning("mark_job_run: job_id %s not found, skipping save", job_id)
