@@ -3709,7 +3709,15 @@ def run_job(
             and turn_exit_reason.startswith("max_iterations_reached(")
             and bool(final_response_text)
         )
-        if result.get("failed") is True or (result.get("completed") is False and not max_iteration_summary):
+        # If the agent produced substantive output without explicitly failing,
+        # treat it as success regardless of the specific turn_exit_reason.
+        # The max_iteration_summary bypass above is too narrow — the same
+        # pattern (completed=False + valid output) can occur with other
+        # non-standard exit reasons, e.g. when a follow-up API handshake
+        # fails after the agent already generated the content.
+        if result.get("failed") is not True and bool(final_response_text):
+            pass  # Valid output exists — let through as success
+        elif result.get("failed") is True or (result.get("completed") is False and not max_iteration_summary):
             _err_text = (
                 result.get("error")
                 or final_response_text
