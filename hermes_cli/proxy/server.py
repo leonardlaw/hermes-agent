@@ -29,6 +29,9 @@ from hermes_cli.proxy.adapters.base import UpstreamAdapter, UpstreamCredential
 
 logger = logging.getLogger(__name__)
 
+# Shared aiohttp.ClientSession key — one session per proxy lifetime.
+_HTTP_SESSION_KEY = web.AppKey("http_session", aiohttp.ClientSession)  # type: ignore[type-arg]
+
 # Headers we strip when forwarding to the upstream. ``host``/``content-length``
 # are recomputed by aiohttp; ``authorization`` is replaced with our bearer.
 # Everything else (content-type, accept, user-agent, x-* headers) passes through.
@@ -98,6 +101,13 @@ def create_app(adapter: UpstreamAdapter) -> "web.Application":
     _adapter_key = web.AppKey("adapter", UpstreamAdapter)
     app[_adapter_key] = adapter
 
+    # Shared HTTP session — created once and reused for all upstream requests.
+    # Avoids creating a new ClientSession (and its connection pool) per call.
+    _timeout = aiohttp.ClientTimeout(  # type: ignore[misc]
+        total=None, sock_connect=15, sock_read=300,
+    )
+    app[_HTTP_SESSION_KEY] = aiohttp.ClientSession(timeout=_timeout)  # type: ignore[arg-type]
+
     async def handle_health(request: "web.Request") -> "web.Response":
         return web.json_response(
             {
@@ -133,9 +143,7 @@ def create_app(adapter: UpstreamAdapter) -> "web.Application":
         # the request body too.
         body = await request.read()
 
-        timeout = aiohttp.ClientTimeout(total=None, sock_connect=15, sock_read=300)
-
-        async def _send_upstream(active_cred: UpstreamCredential):
+        async def _send_upstream(active_cred: UpstreamCredential) -> "aiohttp.ClientResponse":
             upstream_url = f"{active_cred.base_url.rstrip('/')}{rel_path}"
             # Preserve query string verbatim.
             if request.query_string:
@@ -149,53 +157,43 @@ def create_app(adapter: UpstreamAdapter) -> "web.Application":
                 request.method, rel_path, upstream_url, len(body),
             )
 
-            try:
-                session = aiohttp.ClientSession(timeout=timeout)
-            except Exception as exc:  # pragma: no cover - aiohttp setup issue
-                raise RuntimeError(f"proxy session init failed: {exc}") from exc
-
-            try:
-                upstream_resp = await session.request(
-                    request.method,
-                    upstream_url,
-                    data=body if body else None,
-                    headers=fwd_headers,
-                    allow_redirects=False,
-                )
-            except Exception:
-                await session.close()
-                raise
-            return session, upstream_resp
+            # Shared session — created once in create_app().  Never close it
+            # here; it lives for the proxy server's lifetime.
+            _session = request.app[_HTTP_SESSION_KEY]
+            upstream_resp = await _session.request(
+                request.method,
+                upstream_url,
+                data=body if body else None,
+                headers=fwd_headers,
+                allow_redirects=False,
+            )
+            return upstream_resp
 
         async def _open_upstream(active_cred: UpstreamCredential):
             try:
-                return await _send_upstream(active_cred)
+                resp = await _send_upstream(active_cred)
+                return resp
             except RuntimeError as exc:
-                return _json_error(500, str(exc)), None
+                return _json_error(500, str(exc))
             except aiohttp.ClientError as exc:
                 logger.warning("proxy: upstream connection failed: %s", exc)
-                return (
-                    _json_error(
-                        502,
-                        f"upstream connection failed: {exc}",
-                        code="upstream_unreachable",
-                    ),
-                    None,
+                return _json_error(
+                    502,
+                    f"upstream connection failed: {exc}",
+                    code="upstream_unreachable",
                 )
             except asyncio.TimeoutError:
-                return (
-                    _json_error(
-                        504,
-                        "upstream request timed out",
-                        code="upstream_timeout",
-                    ),
-                    None,
+                return _json_error(
+                    504,
+                    "upstream request timed out",
+                    code="upstream_timeout",
                 )
 
-        session_or_response, upstream_resp = await _open_upstream(cred)
-        if upstream_resp is None:
-            return session_or_response
-        session = session_or_response
+        first_resp = await _open_upstream(cred)
+        if isinstance(first_resp, web.Response):
+            return first_resp
+
+        upstream_resp = first_resp
 
         if upstream_resp.status in {401, 429}:
             try:
@@ -209,11 +207,10 @@ def create_app(adapter: UpstreamAdapter) -> "web.Application":
 
             if retry_cred is not None:
                 upstream_resp.release()
-                await session.close()
-                session_or_response, upstream_resp = await _open_upstream(retry_cred)
-                if upstream_resp is None:
-                    return session_or_response
-                session = session_or_response
+                second_resp = await _open_upstream(retry_cred)
+                if isinstance(second_resp, web.Response):
+                    return second_resp
+                upstream_resp = second_resp
 
         # Stream response back. Headers first, then chunked body.
         resp = web.StreamResponse(
@@ -230,7 +227,8 @@ def create_app(adapter: UpstreamAdapter) -> "web.Application":
             logger.warning("proxy: streaming interrupted: %s", exc)
         finally:
             upstream_resp.release()
-            await session.close()
+            # Shared session is NOT closed here — it lives for the proxy's
+            # entire lifetime and is cleaned up in run_server().
 
         await resp.write_eof()
         return resp
@@ -287,6 +285,11 @@ async def run_server(
     finally:
         logger.info("proxy: shutting down")
         await runner.cleanup()
+        # Close the shared HTTP session acquired in create_app().
+        try:
+            await app[_HTTP_SESSION_KEY].close()
+        except Exception:
+            logger.debug("proxy: shared session close failed (ignored)")
 
 
 __all__ = [
