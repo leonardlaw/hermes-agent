@@ -1160,7 +1160,7 @@ def interruptible_api_call(agent, api_kwargs: dict):
     # ── Record provider metric ──────────────────────────────────────
     _record_latency = (time.time() - _call_start) * 1000
     try:
-        from agent.provider_health_monitor import record_api_call
+        from agent.provider_health_monitor import classify_error_type, record_api_call
         _rec_provider = str(getattr(agent, "provider", "") or "")
         _rec_model = str(getattr(agent, "model", "") or "")
         if result["error"] is not None:
@@ -1169,7 +1169,7 @@ def interruptible_api_call(agent, api_kwargs: dict):
                 model=_rec_model,
                 success=False,
                 latency_ms=_record_latency,
-                error_type=type(result["error"]).__name__,
+                error_type=classify_error_type(result["error"]),
             )
         else:
             record_api_call(
@@ -4334,7 +4334,7 @@ def interruptible_streaming_api_call(agent, api_kwargs: dict, *, on_first_delta=
             )
             # Record stream stale as a provider metric
             try:
-                from agent.provider_health_monitor import record_api_call
+                from agent.provider_health_monitor import classify_error_type, record_api_call
                 record_api_call(
                     provider=str(getattr(agent, "provider", "") or ""),
                     model=str(getattr(agent, "model", "") or ""),
@@ -4468,7 +4468,7 @@ def interruptible_streaming_api_call(agent, api_kwargs: dict, *, on_first_delta=
             # Record partial-stream result: the stream delivered some content
             # but failed before finishing. Treat as a soft failure.
             try:
-                from agent.provider_health_monitor import record_api_call
+                from agent.provider_health_monitor import classify_error_type, record_api_call
                 record_api_call(
                     provider=str(getattr(agent, "provider", "") or ""),
                     model=str(getattr(agent, "model", "") or ""),
@@ -4486,13 +4486,13 @@ def interruptible_streaming_api_call(agent, api_kwargs: dict, *, on_first_delta=
         # Full error — record as failed call
         _record_latency = (time.time() - _stream_call_start) * 1000
         try:
-            from agent.provider_health_monitor import record_api_call
+            from agent.provider_health_monitor import classify_error_type, record_api_call
             record_api_call(
                 provider=str(getattr(agent, "provider", "") or ""),
                 model=str(getattr(agent, "model", "") or ""),
                 success=False,
                 latency_ms=_record_latency,
-                error_type=type(result["error"]).__name__,
+                error_type=classify_error_type(result["error"]),
             )
         except Exception:
             pass
@@ -4500,7 +4500,7 @@ def interruptible_streaming_api_call(agent, api_kwargs: dict, *, on_first_delta=
     # Success — record as successful call
     _record_latency = (time.time() - _stream_call_start) * 1000
     try:
-        from agent.provider_health_monitor import record_api_call
+        from agent.provider_health_monitor import classify_error_type, record_api_call
         record_api_call(
             provider=str(getattr(agent, "provider", "") or ""),
             model=str(getattr(agent, "model", "") or ""),

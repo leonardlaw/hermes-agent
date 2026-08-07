@@ -206,3 +206,31 @@ def format_health_summary() -> str:
         return " | ".join(parts)
     except Exception as exc:
         return f"health-summary-error: {exc}"
+
+
+# Providers sometimes signal a *billing* condition with HTTP 401, which the
+# OpenAI SDK surfaces as AuthenticationError. Labelling that "AuthenticationError"
+# sends operators hunting for a bad API key when the key is valid and the real
+# cause is an exhausted balance (opencode Zen does exactly this: 401 +
+# {"type":"CreditsError","message":"Insufficient balance..."}).
+#
+# Deliberately narrow: only unambiguous billing wording maps to CreditsExhausted.
+# Rate limits keep their own RateLimitError label.
+_CREDITS_MARKERS = (
+    "insufficient balance",
+    "insufficient credit",
+    "creditserror",
+    "payment required",
+)
+
+
+def classify_error_type(exc: BaseException) -> str:
+    """Return an error_type label for ``exc``, separating billing from auth."""
+    name = type(exc).__name__
+    try:
+        blob = str(exc).lower()
+    except Exception:
+        return name
+    if any(marker in blob for marker in _CREDITS_MARKERS):
+        return "CreditsExhausted"
+    return name
